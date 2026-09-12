@@ -1,0 +1,13 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+- insert:
+    - id: minimax-asr
+      name: 'dsh-minimax-asr'
+      config:
+        apiKeyEnv: MINIMAX_API_KEY
+        baseURL: https://api.minimaxi.com
+        model: asr-1.0
+        responseFormat: json
+        language: ''
+        timestampLevel: ''
+        maxFileMB: 50
+        timeoutMs: 180000

@@ -1,0 +1,6 @@
+# Local installs: this package's node_modules holds junctions/symlinks into the
+# host harness installation, so it must never be committed.
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
