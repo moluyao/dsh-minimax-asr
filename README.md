@@ -3,6 +3,9 @@
 把 MiniMax 语音识别（`asr-1.0`）接成 **DeepSeek Harness 全局插件**：一个给模型用的
 `transcribe_audio` 工具、一张设置卡片，以及输入框里的语音输入按钮。
 
+<img width="1752" height="956" alt="34256464645645" src="https://github.com/user-attachments/assets/8dfdb0ba-7788-468c-b7bd-53e70c659c50" />
+
+
 中文 | [English](README.en.md)
 
 ## 它提供什么
