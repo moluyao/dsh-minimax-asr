@@ -47,8 +47,17 @@ function reportEvent(event) {
   }
 }
 
-/** Browser recordings are capped here; MiniMax itself caps one file at 500 s. */
-var MAX_RECORD_SECONDS = 120
+/**
+ * Hard ceiling for a browser recording: MiniMax rejects any file longer than
+ * 500 s, so no configured value may exceed it.
+ */
+var MAX_RECORD_SECONDS = 500
+
+/** Auto-stop length used when the settings section names none. */
+var DEFAULT_RECORD_SECONDS = 300
+
+/** Smallest cap the settings section accepts. */
+var MIN_RECORD_SECONDS = 10
 
 /** Field descriptors: `numeric` fields are written as numbers. */
 var FIELDS = [
@@ -58,11 +67,20 @@ var FIELDS = [
   { key: 'responseFormat', label: 'responseFormat', numeric: false },
   { key: 'language', label: 'language', numeric: false },
   { key: 'timestampLevel', label: 'timestampLevel', numeric: false },
+  { key: 'maxRecordSeconds', label: 'maxRecordSeconds', numeric: true },
   { key: 'maxFileMB', label: 'maxFileMB', numeric: true },
   { key: 'timeoutMs', label: 'timeoutMs', numeric: true },
 ]
 
-var NUMERIC_FIELDS = { maxFileMB: true, timeoutMs: true }
+var NUMERIC_FIELDS = { maxRecordSeconds: true, maxFileMB: true, timeoutMs: true }
+
+/** Render seconds as `m:ss`, the shape the recording pill shows. */
+function formatClock(seconds) {
+  var total = Math.max(0, Math.floor(Number(seconds) || 0))
+  var minutes = Math.floor(total / 60)
+  var rest = total % 60
+  return minutes + ':' + (rest < 10 ? '0' : '') + rest
+}
 
 var DICTIONARIES = {
   en: {
@@ -74,6 +92,7 @@ var DICTIONARIES = {
     responseFormat: 'Response format',
     language: 'Language hint',
     timestampLevel: 'Timestamp level',
+    maxRecordSeconds: 'Max recording (seconds)',
     maxFileMB: 'Max file size (MB)',
     timeoutMs: 'Request timeout (ms)',
     credential: 'Credential',
@@ -106,6 +125,7 @@ var DICTIONARIES = {
     responseFormat: '返回格式',
     language: '语言提示',
     timestampLevel: '时间戳粒度',
+    maxRecordSeconds: '录音时长上限（秒）',
     maxFileMB: '文件大小上限（MB）',
     timeoutMs: '请求超时（毫秒）',
     credential: '凭据',
@@ -557,8 +577,16 @@ function mergeDraft(draft, addition) {
   return /[\s\n]$/u.test(current) ? current + text : `${current} ${text}`
 }
 
-/** Records through the microphone and transcribes through the host route. */
-function MicController() {
+/**
+ * Records through the microphone and transcribes through the host route.
+ * The auto-stop length is read from the same settings namespace the card edits,
+ * so raising "Max recording" in Settings reaches the very next recording.
+ * @param ctx - the browser plugin context, for the settings scope.
+ */
+function MicController(ctx) {
+  this.scope = ctx === undefined || ctx.settingsScope === undefined
+    ? undefined
+    : ctx.settingsScope.bind({ namespace: NS })
   this.store = store.createSnapshotStore({
     status: 'idle',
     seconds: 0,
@@ -566,12 +594,30 @@ function MicController() {
     text: '',
     textSeq: 0,
     supported: recordingSupported(),
+    limitSeconds: this.limitSeconds(),
   })
   this.recorder = null
   this.stream = null
   this.chunks = []
   this.timer = null
   this.startedAt = 0
+  var self = this
+  // A committed settings change re-publishes the cap; a recording already
+  // running keeps the length it started with, which is the least surprising.
+  this.offScope = this.scope === undefined
+    ? undefined
+    : this.scope.subscribe(function () { self.publish({ limitSeconds: self.limitSeconds() }) })
+}
+
+/**
+ * The configured auto-stop length, clamped to what MiniMax accepts.
+ * @returns seconds in `[MIN_RECORD_SECONDS, MAX_RECORD_SECONDS]`.
+ */
+MicController.prototype.limitSeconds = function () {
+  var value = this.scope === undefined ? undefined : this.scope.getSnapshot().value
+  var declared = value !== null && typeof value === 'object' ? Number(value.maxRecordSeconds) : Number.NaN
+  if (!isFinite(declared)) return DEFAULT_RECORD_SECONDS
+  return Math.min(MAX_RECORD_SECONDS, Math.max(MIN_RECORD_SECONDS, Math.round(declared)))
 }
 
 /** Publish a patch over the current snapshot. */
@@ -618,11 +664,14 @@ MicController.prototype.start = function () {
     recorder.onerror = function () { self.fail(new Error('recording failed')) }
     recorder.start()
     self.startedAt = Date.now()
-    self.publish({ status: 'recording', seconds: 0, error: null })
+    // Read the cap once, at start: a settings change mid-recording must not
+    // silently cut a recording the user is still speaking into.
+    var limit = self.limitSeconds()
+    self.publish({ status: 'recording', seconds: 0, error: null, limitSeconds: limit })
     self.timer = setInterval(function () {
       var seconds = Math.floor((Date.now() - self.startedAt) / 1000)
       self.publish({ seconds: seconds })
-      if (seconds >= MAX_RECORD_SECONDS) self.stop()
+      if (seconds >= limit) self.stop()
     }, 500)
   }, function (error) {
     self.fail(error !== null && typeof error === 'object' && typeof error.message === 'string'
@@ -729,6 +778,10 @@ MicController.prototype.fail = function (error) {
 
 /** Stop everything; called when the plugin unloads. */
 MicController.prototype.dispose = function () {
+  if (this.offScope !== undefined) {
+    this.offScope()
+    this.offScope = undefined
+  }
   if (this.timer !== null) {
     clearInterval(this.timer)
     this.timer = null
@@ -879,15 +932,17 @@ function MicButton(props) {
   var recording = state.status === 'recording'
   var busy = state.status === 'transcribing' || state.status === 'starting'
   var failed = state.status === 'error'
+  var limit = state.limitSeconds === undefined ? DEFAULT_RECORD_SECONDS : state.limitSeconds
   var label = !supported
     ? t('micUnsupported')
     : recording
-      ? t('micStop')
+      // The cap belongs in the tooltip: the pill itself stays narrow.
+      ? `${t('micStop')} · ${formatClock(limit)}`
       : busy
         ? t('micTranscribing')
         : failed
           ? `${t('micFailed')}: ${state.error}`
-          : t('micStart')
+          : `${t('micStart')} · ${formatClock(limit)}`
 
   var hoverPair = React.useState(false)
   var hovered = hoverPair[0]
@@ -910,7 +965,11 @@ function MicButton(props) {
     onClick: function () { props.toggle() },
   },
     icon,
-    recording ? React.createElement('span', { style: { fontVariantNumeric: 'tabular-nums' } }, `${state.seconds}${t('micSecond')}`) : null,
+    recording
+      ? React.createElement('span',
+        { style: { fontVariantNumeric: 'tabular-nums' } },
+        `${formatClock(state.seconds)} / ${formatClock(limit)}`)
+      : null,
   )
 }
 
@@ -944,7 +1003,7 @@ function apply(ctx) {
   // Voice input: a compact control in the composer tool row. The slot is
   // session-scoped, so the component also receives `useInput`/`inputActions`
   // and can write the transcript into that session's draft.
-  var mic = new MicController()
+  var mic = new MicController(ctx)
   ctx.effect(function () { return function () { mic.dispose() } }, 'dsh-minimax-asr: microphone controller')
   ctx.slots.inject('conversation.input.left', function () {
     reportEvent({ event: 'mic-registered', slot: 'conversation.input.left' })

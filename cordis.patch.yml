@@ -9,5 +9,6 @@
         responseFormat: json
         language: ''
         timestampLevel: ''
+        maxRecordSeconds: 300
         maxFileMB: 50
         timeoutMs: 180000

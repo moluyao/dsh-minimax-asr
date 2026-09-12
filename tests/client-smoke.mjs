@@ -79,6 +79,7 @@ const scopeSnapshot = {
     responseFormat: 'json',
     language: '',
     timestampLevel: '',
+    maxRecordSeconds: 300,
     maxFileMB: 50,
     timeoutMs: 180000,
   },
@@ -88,11 +89,15 @@ const scopeSnapshot = {
   writable: true,
   mode: 'host',
 }
+
 const scope = {
   getSnapshot: () => scopeSnapshot,
-  subscribe: () => () => {},
+  // A live settings mirror: the test can move the section and fire the
+  // listeners the plugin subscribed, exactly as a committed write does.
+  subscribe: (listener) => { scopeListeners.push(listener); return () => {} },
   mutate: async (ops, revision) => { mutations.push({ ops, revision }) },
 }
+const scopeListeners = []
 
 const registered = []
 const injected = []
@@ -212,10 +217,19 @@ const sandbox = {
     }
   },
   Blob,
-  setInterval,
-  clearInterval,
-  Date,
+  // A controllable clock and interval registry, so the auto-stop can be driven
+  // without waiting for real seconds to pass.
+  setInterval: (callback) => { intervals.push(callback); return intervals.length },
+  clearInterval: () => {},
+  Date: { now: () => clock.now },
   console,
+}
+const clock = { now: 1_700_000_000_000 }
+const intervals = []
+/** Advance the fake clock and run every scheduled tick once. */
+function advance(seconds) {
+  clock.now += seconds * 1000
+  for (const tick of [...intervals]) tick()
 }
 vm.createContext(sandbox)
 vm.runInContext(source, sandbox, { filename: 'client.js' })
@@ -309,7 +323,7 @@ findHeader(first).props.onClick()
 const open = render()
 check(findHeader(open).props['aria-expanded'] === true, 'header expands the card')
 
-const fields = ['baseURL', 'model', 'apiKeyEnv', 'responseFormat', 'language', 'timestampLevel', 'maxFileMB', 'timeoutMs']
+const fields = ['baseURL', 'model', 'apiKeyEnv', 'responseFormat', 'language', 'timestampLevel', 'maxRecordSeconds', 'maxFileMB', 'timeoutMs']
 for (const field of fields) check(findInput(open, `minimax-asr-${field}`) !== undefined, `input rendered: ${field}`)
 check(findInput(open, 'minimax-asr-model').props.value === 'asr-1.0', 'model input shows the resolved value')
 check(findInput(open, 'minimax-asr-model').props.disabled === false, 'inputs are enabled (host mode, writable)')
@@ -407,7 +421,7 @@ micStore.set({ status: 'recording', seconds: 7, error: null, text: '', textSeq: 
 const recording = renderMic('')
 const labels = []
 walk(recording, (node) => { if (typeof node.children?.[0] === 'string') labels.push(node.children[0]) })
-check(labels.includes('7s'), `recording shows elapsed time (${JSON.stringify(labels)})`)
+check(labels.includes('0:07 / 5:00'), `recording shows elapsed time against the cap (${JSON.stringify(labels)})`)
 check(String(buttonsOf(recording)[0].props['aria-label']).includes('Stop'), `recording label: ${JSON.stringify(buttonsOf(recording)[0].props['aria-label'])}`)
 
 // Transcribing: disabled while the request is in flight.
@@ -532,5 +546,38 @@ check(events.includes('card-registered'), 'reported the settings-card registrati
 check(events.includes('mic-registered'), 'reported the mic registration')
 check(events.includes('mic-rendered'), 'reported the mic control rendering')
 check(diagnostics.every(entry => typeof entry.event === 'string'), 'every report is a plain event object')
+
+// --- the configured cap drives the auto-stop --------------------------------
+
+/** Move the settings section and notify the plugin, as a committed write does. */
+function setMaxRecordSeconds(value) {
+  scopeSnapshot.value.maxRecordSeconds = value
+  for (const listener of scopeListeners) listener()
+}
+
+check(micStore.getSnapshot().limitSeconds === 300, `cap starts at the section value (${micStore.getSnapshot().limitSeconds})`)
+
+setMaxRecordSeconds(45)
+check(micStore.getSnapshot().limitSeconds === 45, `cap follows a settings change (${micStore.getSnapshot().limitSeconds})`)
+
+setMaxRecordSeconds(3600)
+check(micStore.getSnapshot().limitSeconds === 500, `cap clamps to MiniMax's 500 s ceiling (${micStore.getSnapshot().limitSeconds})`)
+
+setMaxRecordSeconds(1)
+check(micStore.getSnapshot().limitSeconds === 10, `cap clamps up to the 10 s floor (${micStore.getSnapshot().limitSeconds})`)
+
+// One recording driven past a 20 s cap must stop and upload by itself.
+setMaxRecordSeconds(20)
+const uploadsBefore = media.calls.length
+pipelineFace.toggle()
+await tick(4)
+check(micStore.getSnapshot().status === 'recording', 'the capped recording started')
+check(micStore.getSnapshot().limitSeconds === 20, `the running recording took the current cap (${micStore.getSnapshot().limitSeconds})`)
+advance(20)
+await tick(12)
+const capped = micStore.getSnapshot()
+check(capped.status === 'idle', `auto-stop completed the upload (status=${capped.status} error=${capped.error})`)
+check(media.calls.length === uploadsBefore + 1, `auto-stop uploaded exactly one recording (${media.calls.length - uploadsBefore})`)
+check(capped.textSeq === 12, `textSeq advanced again to ${capped.textSeq}`)
 
 console.log('\nclient half: all checks passed')

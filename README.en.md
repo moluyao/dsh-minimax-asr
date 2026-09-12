@@ -91,6 +91,17 @@ upload is bounded by the same `maxFileMB` the tool uses. A microphone permission
 prompt is expected the first time per origin; a refusal surfaces in the control's
 tooltip, and the tracks are always released.
 
+**Recording length** defaults to **300 s (5 minutes)** and is editable under
+Settings → Plugins → MiniMax ASR → *Max recording (seconds)* — anything from 10
+to 500, taking effect on the **next** recording (a change never truncates one
+already in progress). While recording the control shows `elapsed / cap`, e.g.
+`1:23 / 5:00`, and stops itself at the cap.
+
+MiniMax's own ceiling is **500 s per file (about 8m20s)** and it rejects longer
+audio with a 400 rather than truncating, so **a 10-minute recording cannot be one
+request** — 500 s is the most this plugin can offer. Size is not the constraint:
+16 kHz mono 16-bit WAV is about 32 KB/s, so 500 s is ≈16 MB of the 50 MB budget.
+
 ## Local routes
 
 Both routes live under one fenced prefix — loopback `Host`, no cross-site marker,
