@@ -4,6 +4,41 @@ All notable changes to this plugin. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — handsfree that survives a pause, and noise that stays noise
+
+Two defects from real use, both in the handsfree loop.
+
+### Fixed
+
+- **A pause no longer ends the conversation.** The loop released the microphone
+  after thirty seconds without speech, so a reply would arrive, the microphone
+  would close, and anything said a moment later went nowhere. A handsfree window
+  is now disposable: when it fills up — at the recording cap, or after a blip too
+  short to be a sentence — it is rolled over on the still-open stream, the bytes
+  are discarded, and a fresh recorder starts. The microphone indicator never
+  drops, and a manual recording still stops at the cap as before. The thirty
+  seconds became a thirty-minute safety net for the case where the user walked
+  away and left the loop on.
+- **Room noise is never transcribed.** Anything louder than the room counted as
+  speech, so a creak or a keypress was uploaded, and the recogniser answered the
+  near-silence with an invented sentence — which the loop then submitted as the
+  user's own words (twelve times, on the machine this was found on). A window now
+  has to *look like speech*: frames are measured against an absolute speech level
+  rather than only against the room, and at least 600 ms of them must be speech
+  before the window is worth transcribing. Anything shorter is dropped without
+  reaching the endpoint. The gate's absolute floor also rose from 0.0025 to
+  0.008, above the room levels that machine reports (0.0003–0.005) instead of
+  below them.
+
+### Notes
+
+- Both cases are regression-tested: thirty seconds of room noise uploads nothing
+  and produces zero speech frames, a 400 ms blip sends nothing, and a silent
+  window rolls over while the microphone stays open.
+- `tests/client-smoke.mjs` also stopped leaking timers — its fake
+  `clearInterval` was a no-op, so VAD timers from earlier windows kept mutating
+  later ones.
+
 ## [0.2.0] — spoken announcements, handsfree conversation, 303 voices
 
 Everything below is verified by the off-harness test suites
@@ -89,5 +124,6 @@ Three defects that the new tests caught, all of them reachable in a real browser
 - `tests/smoke.mjs` and `tests/client-smoke.mjs`, and the single-activation-site
   invariant in `tests/installed-check.mjs`.
 
+[0.2.1]: https://github.com/moluyao/dsh-minimax-asr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/moluyao/dsh-minimax-asr/compare/533a699...v0.2.0
 [0.1.0]: https://github.com/moluyao/dsh-minimax-asr/commit/533a699
