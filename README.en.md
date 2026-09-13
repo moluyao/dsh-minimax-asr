@@ -5,7 +5,19 @@ MiniMax speech-to-text (`asr-1.0`) and text-to-speech (`speech-2.8-hd`) as a
 `announce_speech` tools, a settings card, voice input in the composer, spoken
 announcements, and handsfree conversation.
 
-English | [中文](README.md) | [Changelog](CHANGELOG.md) | **v0.2.0**
+English | [中文](README.md) | [Changelog](CHANGELOG.md) | **v0.2.1**
+
+## 30-second demo
+
+<!-- Once you have recorded it, replace the next line with:
+     ![A finished task is read out loud; you answer, and it sends by itself](docs/demo.gif) -->
+
+![A finished task is read out loud; you answer, and it sends by itself](docs/demo-placeholder.svg)
+
+**The task finishes → the speaker reads one distilled sentence → you say something → it is transcribed and sent for you → the reply is read out, and the microphone reopens by itself.** No keyboard, no mouse.
+(The part people remember: **what is spoken is a line written for the ear, not a reading of the reply**.)
+
+> Want to record your own? The shot list is in [`docs/demo-script.md`](docs/demo-script.md).
 
 ## What it adds
 
