@@ -75,8 +75,13 @@ var VAD_MAX_GATE = 0.03
 var VAD_SETTLE_MS = 300
 /** Silence after speech that ends the turn. */
 var VAD_SILENCE_MS = 1200
-/** Give up and release the microphone when nothing is said for this long. */
-var VAD_IDLE_MS = 30000
+/**
+ * Release the microphone only after this long with nothing said at all. The
+ * window rolls over long before this, so a user who pauses to think keeps
+ * talking into an open microphone; this is the "walked away and left it on"
+ * safety net, not a conversational time limit.
+ */
+var VAD_IDLE_MS = 30 * 60 * 1000
 /** How often the measured level is reported to the host, for tuning. */
 var VAD_REPORT_MS = 1000
 /** Longest single spoken turn the loop will record. */
@@ -1278,9 +1283,10 @@ MicController.prototype.startMeter = function () {
     if (spoken && self.quietSince !== 0 && now - self.quietSince >= VAD_SILENCE_MS) {
       if (self.speechFrames < VAD_MIN_SPEECH_FRAMES) {
         // A blip, not a sentence. Sending this would have the recogniser invent
-        // one, and the loop would post the invention as the user's words.
+        // one, and the loop would post the invention as the user's words — but
+        // it is still not the end of the conversation.
         reportEvent({ event: 'mic-too-short', speechFrames: self.speechFrames })
-        self.abandonHandsfree(true)
+        self.rollHandsfree()
         return
       }
       // Said something, then stopped: that is the end of the turn.
@@ -1289,7 +1295,7 @@ MicController.prototype.startMeter = function () {
     }
     if (spoken && elapsed >= VAD_MAX_TURN_MS) {
       if (self.speechFrames < VAD_MIN_SPEECH_FRAMES) {
-        self.abandonHandsfree(true)
+        self.rollHandsfree()
         return
       }
       self.stop()
@@ -1363,37 +1369,7 @@ MicController.prototype.start = function () {
     }
     self.stream = stream
     self.chunks = []
-    var options = {}
-    if (typeof window.MediaRecorder.isTypeSupported === 'function'
-      && window.MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-      options.mimeType = 'audio/webm;codecs=opus'
-    }
-    var recorder = new window.MediaRecorder(stream, options)
-    self.recorder = recorder
-    recorder.ondataavailable = function (event) {
-      if (event.data !== null && event.data !== undefined && event.data.size > 0) self.chunks.push(event.data)
-    }
-    recorder.onstop = function () { self.finish() }
-    recorder.onerror = function () { self.fail(new Error('recording failed')) }
-    recorder.start()
-    self.startedAt = Date.now()
-    // Read the cap once, at start: a settings change mid-recording must not
-    // silently cut a recording the user is still speaking into.
-    var limit = self.limitSeconds()
-    self.publish({
-      status: 'recording',
-      seconds: 0,
-      error: null,
-      limitSeconds: limit,
-      handsfree: self.vad === true,
-      heard: false,
-    })
-    self.timer = setInterval(function () {
-      var seconds = Math.floor((Date.now() - self.startedAt) / 1000)
-      if (self.vad !== true) self.publish({ seconds: seconds })
-      if (seconds >= limit) self.stop()
-    }, 500)
-    if (self.vad === true) self.startMeter()
+    self.beginWindow(stream)
   }, function (error) {
     self.vad = false
     self.stopMeter()
@@ -1402,6 +1378,94 @@ MicController.prototype.start = function () {
       ? error
       : new Error('microphone permission was refused'))
   })
+}
+
+/**
+ * Start one recording window on an open stream: a recorder, the elapsed-time
+ * clock, and — in handsfree mode — the level meter.
+ *
+ * A handsfree window is disposable. When it fills up it is rolled over instead
+ * of stopped (see {@link MicController.rollHandsfree}), which is what lets the
+ * microphone stay open for as long as the user wants to keep talking to it.
+ * @param stream - the live microphone stream.
+ */
+MicController.prototype.beginWindow = function (stream) {
+  var self = this
+  var options = {}
+  if (typeof window.MediaRecorder.isTypeSupported === 'function'
+    && window.MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+    options.mimeType = 'audio/webm;codecs=opus'
+  }
+  var recorder = new window.MediaRecorder(stream, options)
+  this.recorder = recorder
+  this.abandoned = false
+  recorder.ondataavailable = function (event) {
+    if (event.data !== null && event.data !== undefined && event.data.size > 0) self.chunks.push(event.data)
+  }
+  recorder.onstop = function () { self.finish() }
+  recorder.onerror = function () { self.fail(new Error('recording failed')) }
+  recorder.start()
+  this.startedAt = Date.now()
+  this.speechFrames = 0
+  this.heardFrames = 0
+  this.quietSince = 0
+  this.loudest = 0
+  this.floor = null
+  var limit = this.limitSeconds()
+  this.publish({
+    status: 'recording',
+    seconds: 0,
+    error: null,
+    limitSeconds: limit,
+    handsfree: this.vad === true,
+    heard: false,
+  })
+  if (this.timer !== null) clearInterval(this.timer)
+  this.timer = setInterval(function () {
+    var seconds = Math.floor((Date.now() - self.startedAt) / 1000)
+    if (self.vad !== true) self.publish({ seconds: seconds })
+    if (seconds >= limit) {
+      // Handsfree listening does not end here: the window is discarded and a
+      // fresh one opens on the same stream, because the user may simply not
+      // have spoken yet.
+      if (self.vad === true) self.rollHandsfree()
+      else self.stop()
+    }
+  }, 500)
+  if (this.vad === true) {
+    this.stopMeter()
+    this.startMeter()
+  }
+}
+
+/**
+ * Close the current handsfree window without uploading it, and open the next one
+ * on the still-open microphone. Nothing spoken means nothing to transcribe — it
+ * does not mean the exchange is over.
+ */
+MicController.prototype.rollHandsfree = function () {
+  if (this.vad !== true) return
+  reportEvent({
+    event: 'handsfree-roll',
+    seconds: Math.round((Date.now() - this.startedAt) / 1000),
+    speechFrames: this.speechFrames,
+  })
+  var recorder = this.recorder
+  this.recorder = null
+  this.chunks = []
+  this.abandoned = true
+  if (recorder !== null && recorder.state !== 'inactive') {
+    try {
+      // Detached: this window's bytes are discarded, never transcribed.
+      recorder.onstop = null
+      recorder.stop()
+    } catch (error) {
+      // Already stopped.
+    }
+  }
+  this.abandoned = false
+  if (this.stream === null || this.vad !== true) return
+  this.beginWindow(this.stream)
 }
 
 /** Stop recording; the recorder's own `onstop` continues into transcription. */

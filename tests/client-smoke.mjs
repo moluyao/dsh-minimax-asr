@@ -1030,12 +1030,14 @@ voiceFace.attachInput({
   sessionId: 'session-x',
 })
 
-// 1. Nothing said for the whole window releases the microphone, no upload.
+// 1. A pause is not an ending: the window rolls over and the microphone stays
+// open, so the user can talk whenever they get round to it.
 media.level = 0
 // The render checks above wrote partial snapshots; the loop counts exchanges.
 speechStore.set({ ...speechStore.getSnapshot(), exchanges: 0, stage: 'off', loop: false, loopNote: null })
 micStore.set({ status: 'idle', seconds: 0, error: null, text: '', textSeq: 12, supported: true, silent: false })
 const uploadsBeforeLoop = media.calls.length
+const rolls = () => diagnostics.filter(entry => entry.event === 'handsfree-roll').length
 voiceFace.toggleLoop()
 check(speechStore.getSnapshot().loop === true, 'the loop turns on')
 await tick(4)
@@ -1045,20 +1047,21 @@ const loopMutation = mutations[mutations.length - 1]
 check(loopMutation.ops.some(op => op.path[0] === 'voiceLoop' && op.value === true),
   `the loop is persisted: ${JSON.stringify(loopMutation.ops)}`)
 
+const rollsBefore = rolls()
 vadFrames(305)
 await tick(6)
-check(speechStore.getSnapshot().stage === 'paused', `an empty window pauses the loop (${speechStore.getSnapshot().stage})`)
-check(speechStore.getSnapshot().loopNote === 'heard-nothing', `the pause says why (${speechStore.getSnapshot().loopNote})`)
-check(micStore.getSnapshot().status === 'idle', 'the microphone was released')
+check(speechStore.getSnapshot().stage === 'listening', `silence does not end the conversation (${speechStore.getSnapshot().stage})`)
+check(micStore.getSnapshot().status === 'recording', 'the microphone is still open')
+check(rolls() > rollsBefore, `the silent window rolled over (${rolls() - rollsBefore})`)
 check(media.calls.length === uploadsBeforeLoop, `silence was never uploaded (${media.calls.length - uploadsBeforeLoop})`)
 check(diagnostics.some(entry => entry.event === 'mic-level'), 'the measured microphone level was reported to the host')
 const levelReport = diagnostics.filter(entry => entry.event === 'mic-level').pop()
 check(typeof levelReport.gate === 'number' && levelReport.gate >= 0.008, `the gate has an absolute floor (${levelReport.gate})`)
 
-// 1b. Room noise is not speech. A level that clears the gate but never reaches
-// the speech bar must not be uploaded: near-silence reaches the recogniser as an
-// invented sentence ("他出生于伦敦。" arrived this way, twelve times), and the
-// loop would post that invention as the user's own words.
+// 1b. Room noise is not speech either, and it must not end the conversation
+// while it is being rejected: near-silence reaches the recogniser as an invented
+// sentence ("他出生于伦敦。" arrived this way, twelve times), and the loop would
+// post that invention as the user's own words.
 voiceFace.toggleLoop()
 voiceFace.toggleLoop()
 await tick(4)
@@ -1066,8 +1069,9 @@ const uploadsBeforeNoise = media.calls.length
 media.level = 0.012
 vadFrames(305)
 await tick(8)
-check(speechStore.getSnapshot().stage === 'paused', `noise pauses the loop instead of submitting (${speechStore.getSnapshot().stage})`)
 check(media.calls.length === uploadsBeforeNoise, `noise was never uploaded (${media.calls.length - uploadsBeforeNoise})`)
+check(speechStore.getSnapshot().stage === 'listening', `noise does not end the conversation (${speechStore.getSnapshot().stage})`)
+check(micStore.getSnapshot().status === 'recording', 'the microphone stays open through noise')
 const noiseReport = diagnostics.filter(entry => entry.event === 'mic-level').pop()
 check(noiseReport.speechFrames === 0, `noise produced no speech frames (${noiseReport.speechFrames})`)
 
