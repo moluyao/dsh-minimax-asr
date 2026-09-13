@@ -710,6 +710,29 @@ micStore.set({ status: 'idle', seconds: 0, error: null, text: '', textSeq: 3, su
 const unsupportedButton = buttonsOf(renderMic(''))[0]
 check(unsupportedButton.props.style.opacity === 0.5, 'an unsupported browser dims the control')
 
+// Standby must not read as "recording". The handsfree loop keeps the microphone
+// open, but until it hears something worth transcribing nothing is kept and
+// nothing will be sent — and a clock ticking up for minutes reads as a runaway
+// recorder to the person watching it.
+micStore.set({
+  status: 'recording', seconds: 42, error: null, text: '', textSeq: 3, supported: true, handsfree: true, heard: false,
+})
+const standby = renderMic('')
+check(buttonsOf(standby)[0].props.style.background === 'transparent', 'standby is not painted as recording')
+const standbyText = []
+walk(standby, (node) => { if (typeof node.children?.[0] === 'string') standbyText.push(node.children[0]) })
+check(!standbyText.some(text => text.includes('/ 5:00')), `standby shows no running clock (${JSON.stringify(standbyText)})`)
+check(String(buttonsOf(standby)[0].props.title).includes('Waiting for you'), `standby tooltip: ${JSON.stringify(buttonsOf(standby)[0].props.title)}`)
+
+micStore.set({
+  status: 'recording', seconds: 3, error: null, text: '', textSeq: 3, supported: true, handsfree: true, heard: true,
+})
+const speaking = renderMic('')
+check(String(buttonsOf(speaking)[0].props.title).includes('Stop'), 'hearing speech switches the control back to recording')
+const speakingText = []
+walk(speaking, (node) => { if (typeof node.children?.[0] === 'string') speakingText.push(node.children[0]) })
+check(speakingText.some(text => text.includes('/ 5:00')), `recording shows the clock again (${JSON.stringify(speakingText)})`)
+
 // --- full pipeline: record -> decode -> WAV -> route -> insert --------------
 
 /** Let pending promise chains settle. */

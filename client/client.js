@@ -92,6 +92,13 @@ var VAD_MAX_TURN_MS = 300000
 var VAD_IDLE_MS = 30 * 60 * 1000
 /** How often the measured level is reported to the host, for tuning. */
 var VAD_REPORT_MS = 1000
+/**
+ * How long a handsfree window may run before it is discarded *while nothing has
+ * been said*. Buffering room noise is pointless — it can never be transcribed —
+ * so a standby window is short, and it keeps the memory a long listen costs
+ * bounded without touching a window that holds real speech.
+ */
+var VAD_STANDBY_ROLL_MS = 20000
 
 /**
  * Report one wiring fact to the host. A deployment that composes no web server
@@ -242,6 +249,7 @@ var DICTIONARIES = {
     micTranscribing: 'Transcribing...',
     micFailed: 'Transcription failed',
     micUnsupported: 'This browser cannot record audio here (a microphone and a secure context are required).',
+    micStandby: 'Waiting for you to speak (nothing is sent until you do)',
     micSecond: 's',
   },
   zh: {
@@ -309,6 +317,7 @@ var DICTIONARIES = {
     micTranscribing: '转写中…',
     micFailed: '转写失败',
     micUnsupported: '当前浏览器无法录音（需要麦克风与安全上下文）。',
+    micStandby: '正在等你说话（没说话就不会发送）',
     micSecond: '秒',
   },
 }
@@ -1366,6 +1375,11 @@ MicController.prototype.startMeter = function () {
         return
       }
       self.stop()
+      return
+    }
+    if (!spoken && elapsed >= VAD_STANDBY_ROLL_MS) {
+      // Nothing but room noise so far: drop it and keep waiting, quietly.
+      self.rollHandsfree()
       return
     }
     if (!spoken && elapsed >= VAD_IDLE_MS) {
@@ -2503,19 +2517,26 @@ function MicButton(props) {
 
   var supported = state.supported === true
   var recording = state.status === 'recording'
+  // Standby: the handsfree loop has the microphone open but has heard nothing
+  // worth transcribing yet. It must not read as "recording" — nothing is being
+  // kept, nothing will be sent, and a clock ticking up for minutes on end reads
+  // as a runaway recorder to anyone watching it.
+  var standby = recording && state.handsfree === true && state.heard !== true
   var busy = state.status === 'transcribing' || state.status === 'starting'
   var failed = state.status === 'error'
   var limit = state.limitSeconds === undefined ? DEFAULT_RECORD_SECONDS : state.limitSeconds
   var label = !supported
     ? t('micUnsupported')
-    : recording
-      // The cap belongs in the tooltip: the pill itself stays narrow.
-      ? `${t('micStop')} · ${formatClock(limit)}`
-      : busy
-        ? t('micTranscribing')
-        : failed
-          ? `${t('micFailed')}: ${state.error}`
-          : `${t('micStart')} · ${formatClock(limit)}`
+    : standby
+      ? t('micStandby')
+      : recording
+        // The cap belongs in the tooltip: the pill itself stays narrow.
+        ? `${t('micStop')} · ${formatClock(limit)}`
+        : busy
+          ? t('micTranscribing')
+          : failed
+            ? `${t('micFailed')}: ${state.error}`
+            : `${t('micStart')} · ${formatClock(limit)}`
 
   var hoverPair = React.useState(false)
   var hovered = hoverPair[0]
@@ -2523,14 +2544,14 @@ function MicButton(props) {
   var disabled = !supported || busy
   // 18px rather than the siblings' 16: this control has no text label, and the
   // glyph has to read at a glance.
-  var icon = recording ? StopGlyph(18) : busy ? WavesGlyph(18) : MicGlyph(18)
+  var icon = recording && !standby ? StopGlyph(18) : busy ? WavesGlyph(18) : MicGlyph(18)
 
   return React.createElement('button', {
     type: 'button',
     title: label,
     'aria-label': supported ? (recording ? t('micStop') : t('micStart')) : t('micUnsupported'),
     disabled: disabled,
-    style: micStyle({ recording: recording, failed: failed, hovered: hovered, disabled: disabled, busy: busy }),
+    style: micStyle({ recording: recording && !standby, failed: failed, hovered: hovered, disabled: disabled, busy: busy }),
     onMouseEnter: function () { setHovered(true) },
     onMouseLeave: function () { setHovered(false) },
     onFocus: function () { setHovered(true) },
@@ -2538,7 +2559,7 @@ function MicButton(props) {
     onClick: function () { props.toggle() },
   },
     icon,
-    recording
+    recording && !standby
       ? React.createElement('span',
         { style: { fontVariantNumeric: 'tabular-nums' } },
         `${formatClock(state.seconds)} / ${formatClock(limit)}`)
