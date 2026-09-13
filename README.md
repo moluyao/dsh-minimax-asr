@@ -8,7 +8,7 @@
 
 
 
-中文 | [English](README.en.md) | [更新日志](CHANGELOG.md) | **v0.2.1**
+中文 | [English](README.en.md) | [更新日志](CHANGELOG.md) | [![最新版本](https://img.shields.io/github/v/tag/moluyao/dsh-minimax-asr?label=%E7%89%88%E6%9C%AC)](https://github.com/moluyao/dsh-minimax-asr/releases)
 
 ## 30 秒演示
 

@@ -5,7 +5,7 @@ MiniMax speech-to-text (`asr-1.0`) and text-to-speech (`speech-2.8-hd`) as a
 `announce_speech` tools, a settings card, voice input in the composer, spoken
 announcements, and handsfree conversation.
 
-English | [中文](README.md) | [Changelog](CHANGELOG.md) | **v0.2.1**
+English | [中文](README.md) | [Changelog](CHANGELOG.md) | [![Latest tag](https://img.shields.io/github/v/tag/moluyao/dsh-minimax-asr)](https://github.com/moluyao/dsh-minimax-asr/releases)
 
 ## 30-second demo
 
