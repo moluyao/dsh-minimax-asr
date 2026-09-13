@@ -4,6 +4,38 @@ All notable changes to this plugin. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — standby listening looks like waiting, and buffers like it too
+
+Asked from real use: the loop is always listening, so is it always recording —
+and does sitting there cost anything?
+
+It costs nothing. A window that holds no speech is never uploaded, so the
+recogniser is never called and no tokens are spent; the audio stays in the
+browser and is discarded. What it did cost was reassurance, and that was a real
+defect.
+
+### Changed
+
+- **The control no longer looks like a runaway recorder.** While the loop is open
+  and has heard nothing worth transcribing it stays quiet — no red pill, no
+  clock ticking up for minutes — and its tooltip says what is actually happening
+  (`正在等你说话（没说话就不会发送）`). Real speech switches it back to the
+  recording indicator immediately.
+- **Standby windows stop buffering room noise for five minutes at a time.** A
+  window with nothing in it cannot be transcribed, so it is discarded every
+  twenty seconds and a fresh one opens on the same stream. The memory a long
+  listen costs is bounded by twenty seconds of audio instead of the recording
+  cap; a window that does hold speech still runs to the cap and is sent.
+
+### Verified on the live deployment
+
+A real utterance, from the host's own diagnostics: the level peaked at 0.1768
+against a room floor of 0.0003 — the speech bar is 0.03, so 200x above the noise
+and 6x above the bar — producing 23 speech frames, then a 20-character
+transcript submitted five seconds after the speaker stopped (the configured
+pause). The same trace shows a standby window discarded after twenty seconds
+with two stray frames and **no upload at all**.
+
 ## [0.2.2] — an always-on loop, and a pause you own
 
 Reported from real use: after a reply the loop stopped listening after a while
@@ -178,6 +210,7 @@ Three defects that the new tests caught, all of them reachable in a real browser
 - `tests/smoke.mjs` and `tests/client-smoke.mjs`, and the single-activation-site
   invariant in `tests/installed-check.mjs`.
 
+[0.2.3]: https://github.com/moluyao/dsh-minimax-asr/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/moluyao/dsh-minimax-asr/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/moluyao/dsh-minimax-asr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/moluyao/dsh-minimax-asr/compare/533a699...v0.2.0
