@@ -44,6 +44,9 @@ var MAX_SPEECH_QUEUE = 3
 /** How long to wait before reopening an announcement stream the host refused. */
 var STREAM_RETRY_MS = 4000
 
+/** How long an always-on loop waits before trying to listen again. */
+var LOOP_RETRY_MS = 5000
+
 /** Host route listing the account's voices, for the card's picker. */
 var VOICES_ROUTE = '/minimax-asr/voices'
 
@@ -1001,14 +1004,27 @@ function encodeWav(samples, sampleRate) {
 
 /**
  * Attach a level analyser to a live microphone stream.
+ *
+ * The context is created once and reused for the lifetime of the controller.
+ * That is not an optimisation: Chrome starts a fresh `AudioContext` *suspended*
+ * unless a user gesture is in flight, and an analyser on a suspended context
+ * reports zero for every frame. A window that opened its own context therefore
+ * went deaf the moment it was opened on a timer instead of on a click, which is
+ * why the handsfree loop seemed to stop listening until the user toggled it.
  * @param stream - the microphone stream.
+ * @param existing - the controller's context, reused when it is still open.
  * @returns the analyser handle, or null when the browser has no Web Audio.
  */
-function createLevelMeter(stream) {
+function createLevelMeter(stream, existing) {
   var Ctor = typeof window === 'undefined' ? undefined : window.AudioContext || window.webkitAudioContext
   if (typeof Ctor !== 'function' || typeof stream === 'undefined' || stream === null) return null
   try {
-    var context = new Ctor()
+    var context = existing !== undefined && existing !== null && existing.state !== 'closed' ? existing : new Ctor()
+    if (context.state === 'suspended' && typeof context.resume === 'function') {
+      // A context that is running is the whole point; a rejected resume leaves
+      // the meter reporting zeros, which the diagnostics will show.
+      context.resume().catch(function () {})
+    }
     var source = context.createMediaStreamSource(stream)
     var analyser = context.createAnalyser()
     analyser.fftSize = 2048
@@ -1024,18 +1040,12 @@ function createLevelMeter(stream) {
         for (var i = 0; i < this.buffer.length; i += 1) sum += this.buffer[i] * this.buffer[i]
         return Math.sqrt(sum / this.buffer.length)
       },
+      /** Detach from the stream; the shared context stays open for the next window. */
       close: function () {
         try {
           source.disconnect()
         } catch (error) {
           // Already detached.
-        }
-        if (typeof context.close === 'function') {
-          try {
-            context.close()
-          } catch (error) {
-            // Already closed.
-          }
         }
       },
     }
@@ -1087,6 +1097,8 @@ function MicController(ctx) {
   // Handsfree listening state: the level meter, its frame clock, and what the
   // gate has seen so far.
   this.meter = null
+  /** The one AudioContext every window reuses; see createLevelMeter. */
+  this.audioContext = null
   this.vadTimer = null
   this.vad = false
   /** True while this recording belongs to the handsfree loop. */
@@ -1196,6 +1208,20 @@ MicController.prototype.release = function () {
   this.publish({ status: 'idle', seconds: 0, handsfree: false, heard: false })
 }
 
+/**
+ * Try to have a listening microphone, whatever the previous attempt left
+ * behind: a failed window is dropped and the microphone is opened again.
+ * @returns whether a usable window is open (or already was).
+ */
+MicController.prototype.retry = function () {
+  var status = this.store.getSnapshot().status
+  if (status === 'recording' || status === 'starting' || status === 'transcribing') return true
+  if (this.store.getSnapshot().supported !== true) return false
+  // The failure must not block the next attempt: clear what it left behind.
+  this.abandonHandsfree(false)
+  return this.listen({ force: true }) === true
+}
+
 /** Stop the level meter and its frame clock. */
 MicController.prototype.stopMeter = function () {
   if (this.vadTimer !== null) {
@@ -1228,11 +1254,17 @@ MicController.prototype.clearSilence = function () {
  */
 MicController.prototype.startMeter = function () {
   var self = this
-  this.meter = createLevelMeter(this.stream)
+  this.meter = createLevelMeter(this.stream, this.audioContext)
   if (this.meter === null) {
     // Without Web Audio the gate cannot run: fall back to the configured cap.
+    reportEvent({ event: 'mic-meter-unavailable' })
     this.publish({ error: null })
     return
+  }
+  this.audioContext = this.meter.context
+  if (this.meter.context !== undefined && this.meter.context.state !== 'running') {
+    // Reported so a context that never started is visible from the host.
+    reportEvent({ event: 'mic-audio-context', state: String(this.meter.context.state) })
   }
   this.vadTimer = setInterval(function () {
     var level = self.meter === null ? 0 : self.meter.level()
@@ -1670,6 +1702,8 @@ function SpeechController(ctx, mic) {
   // Re-entrancy guards for the handsfree machine; both stores notify on write.
   this.syncing = false
   this.arming = false
+  /** Pending self-heal of an always-on loop; see scheduleRetry. */
+  this.retryListening = null
   // Pending reopen of a refused announcement stream; see open().
   this.retry = null
   // The mounted session's composer, handed over by the composer control.
@@ -1890,6 +1924,7 @@ SpeechController.prototype.syncLoopOnce = function () {
   }
   if (micStatus === 'error') {
     if (stage !== 'paused') this.publish({ stage: 'paused', loopNote: 'mic-failed' })
+    this.scheduleRetry()
     return
   }
   if (micStatus === 'idle' && this.mic !== undefined) {
@@ -1899,15 +1934,52 @@ SpeechController.prototype.syncLoopOnce = function () {
       // pauses this pass and a later click can start listening again.
       this.publish({ stage: 'paused', loopNote: 'heard-nothing' })
       this.mic.clearSilence()
+      this.scheduleRetry()
       return
     }
   }
   // A submitted message is waiting for the agent: the microphone stays shut,
   // or it would record the reply through the speakers.
   if (stage === 'thinking') return
-  if (stage === 'paused') return
+  if (stage === 'paused') {
+    // An always-on loop does not stay paused: it tries again by itself.
+    this.scheduleRetry()
+    return
+  }
   // Idle on both sides: the user's turn to talk.
   this.arm()
+}
+
+/**
+ * Keep an always-on loop on: if it is switched on but not listening, try again
+ * shortly instead of waiting for the user to toggle the control.
+ *
+ * A handsfree mode that needs a click to come back is not handsfree. Whatever
+ * stopped it — a microphone error, a window that could not be opened, a paused
+ * stage — the loop retries by itself for as long as the switch is on.
+ */
+SpeechController.prototype.scheduleRetry = function () {
+  var self = this
+  if (this.retryListening !== null) return
+  this.retryListening = window.setTimeout(function () {
+    self.retryListening = null
+    if (self.loopEnabled() !== true) return
+    var snapshot = self.store.getSnapshot()
+    if (snapshot.status === 'speaking') return
+    if (self.mic === undefined) return
+    var micStatus = self.mic.store.getSnapshot().status
+    if (micStatus === 'starting' || micStatus === 'recording' || micStatus === 'transcribing') return
+    // Waiting for the agent is not a failure: the reply will re-arm the loop.
+    if (snapshot.stage === 'thinking') return
+    // Open the microphone again rather than re-running the state machine: an
+    // error state would otherwise pause it straight back.
+    if (self.mic.retry() === true) {
+      self.publish({ stage: 'listening', loopNote: null })
+      reportEvent({ event: 'voice-loop-retry', mic: micStatus })
+      return
+    }
+    self.scheduleRetry()
+  }, LOOP_RETRY_MS)
 }
 
 /** Open the microphone for the user's turn, unless it is already open. */

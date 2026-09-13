@@ -277,9 +277,12 @@ inject, the host half's export shape) plus the single-activation-site invariant.
   `POST /v1/get_voice` returns 303 system voices, `/minimax-asr/voices` serves
   them grouped, and the `voice`/`speed` override on `/minimax-asr/speak`
   synthesises real audio (`female-tianmei` → 21 KB of `audio/mpeg`).
-
-Not verified end to end in a browser: an actual spoken recording. Chrome reports
-`microphone: prompt` for a fresh origin, and granting that is the user's gesture.
+- **A real person speaking, all the way round** — reported by the deployment's
+  own diagnostics rather than by a test script: a genuine utterance
+  (`loudest` 0.128, `speechFrames` 14) was transcribed and sent for the user
+  (`voice-submitted`), the reply was read out, and the microphone reopened by
+  itself — with one window rollover (`handsfree-roll`) and zero
+  `mic-idle-timeout` events, which is the pause-then-keep-talking case working.
 
 ## Notes
 

@@ -172,10 +172,22 @@ const media = {
   level: 0,
 }
 
-function fakeAudioContext() {
-  return {
+/** Audio contexts the half created, and how often a suspended one was resumed. */
+const audioContexts = []
+let audioContextResumes = 0
+
+function fakeAudioContext(options) {
+  const handle = {
     sampleRate: 16000,
     closed: false,
+    // Chrome hands out a suspended context unless a user gesture is in flight;
+    // an analyser on it reports zero for every frame.
+    state: 'suspended',
+    resume() {
+      audioContextResumes += 1
+      handle.state = 'running'
+      return Promise.resolve()
+    },
     decodeAudioData(_buffer, resolve) {
       decodeAudioDataCalls += 1
       resolve(media.decoded)
@@ -192,8 +204,11 @@ function fakeAudioContext() {
         },
       }
     },
-    close() { this.closed = true },
+    close() { handle.closed = true; handle.state = 'closed' },
   }
+  // The meter builds its context with no options; decoding passes a sample rate.
+  audioContexts.push({ meterArgs: arguments.length })
+  return handle
 }
 let decodeAudioDataCalls = 0
 
@@ -1091,7 +1106,26 @@ check(media.calls.length === uploadsBeforeBlip, `a 400 ms blip was never uploade
 check(submissions.filter(entry => entry.kind === 'submit').length === submitsBeforeBlip,
   'nothing was sent for a 400 ms blip')
 
-// 2. Speech, then silence: the turn ends by itself and is submitted.
+// 1d. An always-on loop heals itself. A microphone error pauses it, and the
+// loop retries on its own instead of waiting for the user to toggle the switch:
+// a handsfree mode that needs a click to come back is not handsfree.
+micStore.set({ status: 'error', seconds: 0, error: 'microphone permission was refused', text: '', textSeq: 12, supported: true })
+await tick(4)
+check(speechStore.getSnapshot().stage === 'paused', `a microphone error pauses the loop (${speechStore.getSnapshot().stage})`)
+check(!diagnostics.some(entry => entry.event === 'voice-loop-retry'), 'the retry waits its turn')
+runTimers()
+await tick(4)
+check(speechStore.getSnapshot().stage === 'listening' || micStore.getSnapshot().status === 'recording',
+  'the loop retried by itself, with no click')
+check(diagnostics.some(entry => entry.event === 'voice-loop-retry'), 'the self-heal is reported')
+
+// 1e. Windows share one AudioContext. A fresh context starts suspended in
+// Chrome, so a window that built its own would go deaf the moment it opened on a
+// timer rather than on a click — the loop would look like it was listening and
+// never hear anything.
+const meterContexts = audioContexts.filter(entry => entry.meterArgs === 0).length
+check(meterContexts === 1, `the meter created one context for every window (${meterContexts})`)
+check(audioContextResumes > 0, 'a suspended context was resumed rather than left silent')
 voiceFace.toggleLoop()
 check(speechStore.getSnapshot().loop === false, 'the loop turns off')
 check(micStore.getSnapshot().status === 'idle', 'turning it off releases the microphone')
