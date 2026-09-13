@@ -1,16 +1,21 @@
 {
   "name": "dsh-minimax-asr",
-  "version": "0.1.0",
-  "description": "MiniMax speech-to-text (asr-1.0) as a global DeepSeek Harness plugin: a transcribe_audio tool, a settings card, and composer voice input.",
+  "version": "0.2.0",
+  "description": "MiniMax speech-to-text (asr-1.0) and text-to-speech (speech-2.8-hd) as a global DeepSeek Harness plugin: a transcribe_audio tool, an announce_speech tool, a settings card, composer voice input, spoken turn announcements, and handsfree conversation.",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
+    "cordis",
     "minimax",
     "asr",
     "speech-to-text",
     "transcription",
-    "voice-input"
+    "tts",
+    "text-to-speech",
+    "voice-input",
+    "voice",
+    "handsfree"
   ],
   "license": "MIT",
   "type": "module",
@@ -27,6 +32,7 @@
     "cordis.patch.yml",
     "README.md",
     "README.en.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {

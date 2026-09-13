@@ -68,13 +68,26 @@ const host = await import(pathToFileURL(join(packageDir, hostRel)).href)
 check(host.name === 'minimax-asr', `host half exports name ${JSON.stringify(host.name)}`)
 check(typeof host.apply === 'function', 'host half exports apply')
 
-// 6. Single activation site: the row is in the patch layer, not in bundles.
+// 6. Exactly one activation site. The package carries its own bundle patch, so
+// `dsh plugin add` records it in the profile's bundle list; an extra `insert`
+// row in cordis.patch.yml would mount the same id twice and the second mount
+// would fail on the duplicate tool registration.
 const profile = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'))
 const bundles = profile.dsh?.profile?.bundles ?? []
-check(!bundles.includes('dsh-minimax-asr'), `profile bundles exclude dsh-minimax-asr (${bundles.join(', ')})`)
-check(profile.dependencies?.['dsh-minimax-asr'] !== undefined, 'package stays an installed dependency')
+const inBundles = bundles.includes('dsh-minimax-asr')
 const profilePatch = await readFile(join(profileDir, 'cordis.patch.yml'), 'utf8')
-const rows = profilePatch.match(/id:\s*minimax-asr/g) ?? []
-check(rows.length === 1, `exactly one activation row in cordis.patch.yml (${rows.length})`)
+// Comments in that file talk about the row shape, so only real YAML counts.
+const activePatch = profilePatch
+  .split('\n')
+  .filter(line => !/^\s*#/u.test(line))
+  .join('\n')
+const rows = activePatch.match(/id:\s*minimax-asr/g) ?? []
+check(inBundles !== (rows.length > 0), `activated exactly once (bundles: ${inBundles}, patch rows: ${rows.length})`)
+if (inBundles) {
+  check(bundles.filter(name => name === 'dsh-minimax-asr').length === 1, `bundle list names it once (${bundles.join(', ')})`)
+} else {
+  check(rows.length === 1, `exactly one activation row in cordis.patch.yml (${rows.length})`)
+}
+check(profile.dependencies?.['dsh-minimax-asr'] !== undefined, 'package stays an installed dependency')
 
 console.log('\ninstalled state: all checks passed')

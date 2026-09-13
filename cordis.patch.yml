@@ -12,3 +12,14 @@
         maxRecordSeconds: 300
         maxFileMB: 50
         timeoutMs: 180000
+        # Spoken announcements: a finished turn is read out through the
+        # speakers of whichever browser keeps the GUI open.
+        speakEnabled: true
+        ttsModel: speech-2.8-hd
+        ttsVoice: male-qn-jingying
+        ttsSpeed: 1
+        speakMaxChars: 220
+        # Handsfree conversation: after each spoken reply the microphone
+        # reopens by itself, and a finished transcript is submitted with no
+        # click. Off unless the user asks for it (the composer's 对话 button).
+        voiceLoop: false

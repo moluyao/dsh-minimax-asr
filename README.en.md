@@ -1,10 +1,11 @@
 # dsh-minimax-asr
 
-MiniMax speech-to-text (`asr-1.0`) as a **global** DeepSeek Harness plugin: a
-model-facing `transcribe_audio` tool, a settings card, and voice input in the
-composer.
+MiniMax speech-to-text (`asr-1.0`) and text-to-speech (`speech-2.8-hd`) as a
+**global** DeepSeek Harness plugin: model-facing `transcribe_audio` and
+`announce_speech` tools, a settings card, voice input in the composer, spoken
+announcements, and handsfree conversation.
 
-English | [中文](README.md)
+English | [中文](README.md) | [Changelog](CHANGELOG.md) | **v0.2.0**
 
 ## What it adds
 
@@ -13,9 +14,11 @@ English | [中文](README.md)
 | Tool | `transcribe_audio(path, language?, response_format?, timestamp_level?)` |
 | Endpoint | `POST <baseURL>/v1/speech_to_text` (multipart, default `model=asr-1.0`) |
 | Credential | reference `MINIMAX_API_KEY` by default, resolved per request through the credentials seam |
-| Settings | namespace `minimax-asr`: `apiKeyEnv`, `baseURL`, `model`, `responseFormat`, `language`, `timestampLevel`, `maxFileMB`, `timeoutMs` |
+| Settings | namespace `minimax-asr`: `apiKeyEnv`, `baseURL`, `model`, `responseFormat`, `language`, `timestampLevel`, `maxRecordSeconds`, `maxFileMB`, `timeoutMs`, `speakEnabled`, `ttsModel`, `ttsVoice`, `ttsSpeed`, `speakMaxChars`, `voiceLoop` |
 | Card | rendered in Settings → Plugins by `client/client.js` |
 | Voice input | a microphone control in the composer tool row: record → transcribe → append to the draft |
+| Announcements | when a turn finishes, the host pushes its reply to the browser, which reads it out loud (one click mutes it) |
+| Handsfree | the conversation control: once a reply finishes the microphone reopens by itself, and a finished transcript is submitted with no click |
 
 Formats MiniMax accepts: `wav`, `aiff`, `flac`, `m4a`/`alac`, `mp3`, `aac`,
 `opus`, `ogg`. Not accepted: bare PCM, `webm`. A file may be at most 500 seconds
@@ -102,20 +105,99 @@ audio with a 400 rather than truncating, so **a 10-minute recording cannot be on
 request** — 500 s is the most this plugin can offer. Size is not the constraint:
 16 kHz mono 16-bit WAV is about 32 KB/s, so 500 s is ≈16 MB of the 50 MB budget.
 
+## Announcements (host → browser)
+
+You are rarely looking at the screen when a long turn lands, so **every finished
+turn is read out through the speakers**. The point is that *the sentence spoken is
+written for the ear, in that turn* — it is not a slice of the reply.
+
+| Step | What happens |
+| --- | --- |
+| Named | before the turn ends the model calls `announce_speech` with one or two spoken sentences (the outcome, the number that matters, what it needs from you next); the visible reply is untouched |
+| Host | subscribes to `session/event` and pushes that line at `turn/end`; a turn that passed `silent: true` says nothing |
+| Push | one `announce` frame per turn over `GET /minimax-asr/events` (SSE), tagged with `source` — `spoken-line`, `reply-head`, or `silent` |
+| Browser | synthesises through `speech-2.8-hd` (`POST /minimax-asr/speak`) and plays it; several announcements queue instead of overlapping |
+| Mute | the speaker control at the end of the composer tool row; switching it off stops whatever is playing |
+
+**Fallback**: a turn that names no line has only its **opening sentence** spoken
+(the conclusion usually lives there) — never the whole reply. Nothing ever says
+"there is more, I will skip it": an announcement long enough to need that apology
+is an announcement that was not distilled, and the fix is to rewrite it shorter,
+not to read half and apologise. Anything past `speakMaxChars` (default **80**) is
+cut at a sentence boundary with **no explanation added**.
+
+`announce_speech` also refuses an essay-length line (over 600 characters) with a
+reason — "this is a summary of a report, not an announcement" — which forces the
+distillation; that turn then falls back to its opening sentence.
+
+The default voice is `male-qn-jingying`; the card now offers the account's 303
+voices as a picker, where **Test the voice** auditions the current selection
+immediately. The host half also exposes:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /minimax-asr/events` | the announcement stream (SSE) the browser half subscribes to |
+| `POST /minimax-asr/speak` | `{ "text": "..." }` in, `audio/mpeg` bytes out |
+
+`GET /minimax-asr/diagnostics` reports `listeners`, which is the direct answer to
+"how many browsers are currently listening for announcements?".
+
+**Autoplay**: a browser only allows audio after the page has had one user
+interaction. You type in this page, so it normally just plays; if it is blocked,
+the card says so and a click anywhere on the page clears it.
+
+## Handsfree conversation
+
+The rightmost control in the composer tool row is the conversation switch. One
+click starts an exchange that needs no keyboard and no mouse:
+
+| Step | What happens |
+| --- | --- |
+| You talk | the microphone opens by itself; the level gate decides when the turn is over — pausing mid-sentence does not count, 1.2 s of silence does |
+| You stop | the recording is transcribed and **the message is sent for you** (the transcript replaces the draft, so nothing you typed earlier rides along) |
+| It thinks | the microphone is shut while the agent works — otherwise it would record the speakers |
+| It answers | the moment the reply finishes playing, the microphone **reopens by itself** for your next sentence; the exchange count rides the control |
+| Nothing said | a full 30 s without speech releases the microphone and pauses the loop (the control says "nothing was said, click to listen again") instead of holding the mic open or uploading silence |
+| A cancelled turn | the host still pushes a frame with no text: nothing is spoken, but the loop re-arms instead of waiting forever |
+
+The gate is adaptive: it measures the room, takes the larger of "3x the noise"
+and an absolute floor of 0.0025, and caps itself at 0.03 — so a quiet built-in
+microphone array works and a loud room does not deafen the loop. The measured
+numbers (`level`, `floor`, `gate`, `loudest`) are reported once a second to
+`GET /minimax-asr/diagnostics`, so a mis-tuned gate is visible from outside the
+browser.
+
+## Voices
+
+The card's voice field is a **picker**, not a text box: the host half fetches the
+account's catalogue from MiniMax (`POST /v1/get_voice` — 303 system voices in
+testing), groups it by language (Mandarin / Cantonese / English / Japanese /
+Korean / …), and caches it for 10 minutes. A failed fetch falls back to a
+built-in shortlist so the picker always works. A cloned voice, or any id that is
+not in the catalogue, goes through "Custom voice id…".
+
+**Test the voice** auditions whatever the picker currently shows, saved or not,
+so you can try voices until one fits and only then save. Under the hood
+`/minimax-asr/speak` takes optional `voice`/`speed` overrides.
+
 ## Local routes
 
-Both routes live under one fenced prefix — loopback `Host`, no cross-site marker,
-matching `Origin`, the posture the shipped `/api` gateway and the installed
-`dsh-better-sidebar` use (a DNS-rebinding/cross-site defense, not authentication):
+All five routes live under one fenced prefix — loopback `Host`, no cross-site
+marker, matching `Origin`, the posture the shipped `/api` gateway and the
+installed `dsh-better-sidebar` use (a DNS-rebinding/cross-site defense, not
+authentication):
 
 | Route | Purpose |
 | --- | --- |
 | `POST /minimax-asr/transcribe` | one recording in (an `audio/wav` body, optional `?format=`, `?level=`, `?language=`, `?name=`), transcript out |
-| `GET /minimax-asr/diagnostics` | the browser half's wiring report: `applied`, `card-registered`, `mic-registered`, `mic-rendered` (bounded, in memory, no secrets) |
+| `GET /minimax-asr/events` | the announcement stream (SSE): one `announce` frame per finished turn (a cancelled turn carries no text, which re-arms the handsfree loop) |
+| `POST /minimax-asr/speak` | one line synthesised (optional `voice`/`speed` overrides), returned as `audio/mpeg` |
+| `GET /minimax-asr/voices` | the account's voice catalogue as `{id, name, group}`, cached |
+| `GET /minimax-asr/diagnostics` | the browser half's wiring report and measured levels: `applied`, `card-registered`, `mic-registered`, `mic-rendered`, `speaker-registered`, `speech-listening`, `announce-received`, `spoke`, `voice-registered`, `voice-control-rendered`, `voice-loop-listening`, `voice-submitted`, `mic-level` (bounded, in memory, no secrets) |
 | `POST /minimax-asr/diagnostics` | how the browser half files those reports |
 
 `GET /minimax-asr/diagnostics` is the fastest way to answer "is the browser half
-loaded, and did its controls mount?" on a live deployment.
+loaded, did its controls mount, and is the speaker wired?" on a live deployment.
 
 ## Verifying without the harness
 
@@ -129,15 +211,19 @@ node tests/installed-check.mjs <profile-dir>
 `tests/smoke.mjs` loads `lib/index.js`, runs `apply` against a stub context, and
 executes the registered tool against the live endpoint. `tests/route-smoke.mjs`
 drives the registered route with synthetic node requests: every fence and size
-refusal, the diagnostics channel, and one real transcription. `tests/client-smoke.mjs`
+refusal, the diagnostics channel, a completed turn becoming one `announce` frame
+(a cancelled turn staying silent, and a hang-up dropping the listener), plus one
+real transcription and one real synthesis. `tests/client-smoke.mjs`
 loads `client/client.js` the way the browser does (a classic script calling
 `window.__ModuleLoader__.load`) under a stub React/module table, asserts the card's
 render and the exact path ops it writes, and runs the whole microphone pipeline
 with only the codec and the network faked — asserting the uploaded WAV's header,
-rate, and sample count. `tests/installed-check.mjs` resolves the *installed*
+rate, and sample count. It then drives the whole announcement chain: SSE frame →
+synthesis request → playback → queueing → mute → mid-sentence interrupt → recovery
+after a failed synthesis. `tests/installed-check.mjs` resolves the *installed*
 package from the profile and asserts everything the host's client-package scanner
 needs (`dsh.client.platform`, `./client` bytes, the bundle id, every declared
-inject, the host half's export shape) plus the single-activation-row invariant.
+inject, the host half's export shape) plus the single-activation-site invariant.
 
 ## Verified
 
@@ -159,6 +245,26 @@ inject, the host half's export shape) plus the single-activation-row invariant.
   mount that zone.
 - The microphone pipeline (record → decode → 16 kHz mono WAV → route → draft) runs
   green in `tests/client-smoke.mjs` with only the codec and the network faked.
+- The announcement chain is verified on both sides: the host turns one completed
+  turn into a real SSE frame (`route-smoke`), and real MiniMax TTS comes back
+  through `/minimax-asr/speak` as 33 KB of `audio/mpeg`; the browser side (frame →
+  synthesis → playback → queue → mute → interrupt → recovery) runs green in
+  `client-smoke`. That run also caught two real defects: a failed synthesis was
+  immediately masked by the "queue drained" idle write, and an interrupted
+  playback never settled, which wedged the controller so no later announcement was
+  ever spoken.
+- The handsfree loop runs green in `client-smoke`: 30 s of silence releases the
+  microphone without uploading, speech followed by silence ends the turn and
+  submits by itself, a finished reply reopens the microphone, a cancelled turn
+  still re-arms it, and switching off releases the microphone immediately. That
+  run caught three more real defects: a loud first frame could raise the gate
+  above the speaker's own voice (the loop went deaf), switching off while the
+  microphone was still opening left it recording, and the state machine had no
+  re-entrancy guard (unbounded recursion).
+- The catalogue and the audition are verified against the live API:
+  `POST /v1/get_voice` returns 303 system voices, `/minimax-asr/voices` serves
+  them grouped, and the `voice`/`speed` override on `/minimax-asr/speak`
+  synthesises real audio (`female-tianmei` → 21 KB of `audio/mpeg`).
 
 Not verified end to end in a browser: an actual spoken recording. Chrome reports
 `microphone: prompt` for a fresh origin, and granting that is the user's gesture.

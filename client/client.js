@@ -29,6 +29,49 @@ var TRANSCRIBE_ROUTE = '/minimax-asr/transcribe'
 /** Host route this half reports its own wiring to (best effort, no secrets). */
 var DIAGNOSTICS_ROUTE = '/minimax-asr/diagnostics'
 
+/** Host announcement stream: one frame per finished turn (SSE). */
+var EVENTS_ROUTE = '/minimax-asr/events'
+
+/** Host route that synthesises one line of speech. */
+var SPEAK_ROUTE = '/minimax-asr/speak'
+
+/** Voice the host half synthesises with unless the section names another. */
+var DEFAULT_VOICE = 'male-qn-jingying'
+
+/** Announcements kept while one is still playing. Older ones are dropped. */
+var MAX_SPEECH_QUEUE = 3
+
+/** How long to wait before reopening an announcement stream the host refused. */
+var STREAM_RETRY_MS = 4000
+
+/** Host route listing the account's voices, for the card's picker. */
+var VOICES_ROUTE = '/minimax-asr/voices'
+
+// --- handsfree listening ----------------------------------------------------
+// The level gate has to survive a quiet built-in microphone array, so it is
+// adaptive: a floor measured from the room, plus a low absolute minimum.
+
+/** One analysis frame; the gate is evaluated per frame. */
+var VAD_FRAME_MS = 100
+/** Absolute level floor, below which nothing counts as speech. */
+var VAD_MIN_RMS = 0.0025
+/** A frame counts as speech above this multiple of the measured noise floor. */
+var VAD_FLOOR_FACTOR = 3
+/** Ceiling on the gate, so a loud room cannot deafen the loop entirely. */
+var VAD_MAX_GATE = 0.03
+/** Ignore this much audio at the start, while the meter settles. */
+var VAD_SETTLE_MS = 300
+/** Consecutive loud frames before the turn is treated as speech. */
+var VAD_SPEECH_FRAMES = 2
+/** Silence after speech that ends the turn. */
+var VAD_SILENCE_MS = 1200
+/** Give up and release the microphone when nothing is said for this long. */
+var VAD_IDLE_MS = 30000
+/** How often the measured level is reported to the host, for tuning. */
+var VAD_REPORT_MS = 1000
+/** Longest single spoken turn the loop will record. */
+var VAD_MAX_TURN_MS = 60000
+
 /**
  * Report one wiring fact to the host. A deployment that composes no web server
  * simply never sees these; a failure here must never affect the feature.
@@ -70,9 +113,36 @@ var FIELDS = [
   { key: 'maxRecordSeconds', label: 'maxRecordSeconds', numeric: true },
   { key: 'maxFileMB', label: 'maxFileMB', numeric: true },
   { key: 'timeoutMs', label: 'timeoutMs', numeric: true },
+  // Rendered as a checkbox by the speech block rather than by `fieldRow`, but
+  // listed here so the save path stages it like any other field.
+  { key: 'speakEnabled', label: 'speakEnabled', numeric: false },
+  { key: 'ttsModel', label: 'ttsModel', numeric: false },
+  { key: 'ttsVoice', label: 'ttsVoice', numeric: false },
+  { key: 'ttsSpeed', label: 'ttsSpeed', numeric: true },
+  { key: 'speakMaxChars', label: 'speakMaxChars', numeric: true },
+  // Rendered as a checkbox by the handsfree block, like `speakEnabled`.
+  { key: 'voiceLoop', label: 'voiceLoop', numeric: false },
 ]
 
-var NUMERIC_FIELDS = { maxRecordSeconds: true, maxFileMB: true, timeoutMs: true }
+var NUMERIC_FIELDS = {
+  maxRecordSeconds: true, maxFileMB: true, timeoutMs: true, ttsSpeed: true, speakMaxChars: true,
+}
+
+/** Boolean fields; a checkbox writes `true`/`false`, never a string. */
+var BOOL_FIELDS = { speakEnabled: true, voiceLoop: true }
+
+/**
+ * Dictionary key for one speech state.
+ * @param speech - the speech snapshot, if the half is mounted.
+ * @returns the label key.
+ */
+function speechStatusKey(speech) {
+  if (speech === undefined || speech.supported !== true) return 'speakUnsupported'
+  if (speech.status === 'error') return 'speakError'
+  if (speech.status === 'speaking') return 'speakSaying'
+  if (speech.enabled !== true) return 'speakIdle'
+  return speech.connected === true ? 'speakListening' : 'speakReady'
+}
 
 /** Render seconds as `m:ss`, the shape the recording pill shows. */
 function formatClock(seconds) {
@@ -95,6 +165,38 @@ var DICTIONARIES = {
     maxRecordSeconds: 'Max recording (seconds)',
     maxFileMB: 'Max file size (MB)',
     timeoutMs: 'Request timeout (ms)',
+    speakEnabled: 'Announce finished turns through the speakers',
+    ttsModel: 'Speech model',
+    ttsVoice: 'Voice',
+    ttsSpeed: 'Speech speed',
+    speakMaxChars: 'Longest announcement (characters)',
+    speakTest: 'Test the voice',
+    speakTesting: 'Synthesising...',
+    speakSample: 'This is how I will report a finished task.',
+    speech: 'Speech',
+    speakIdle: 'off',
+    speakReady: 'ready',
+    speakListening: 'listening',
+    speakSaying: 'speaking',
+    speakError: 'failed',
+    speakToggleOn: 'Turn spoken announcements on',
+    speakToggleOff: 'Turn spoken announcements off',
+    speakUnsupported: 'This browser cannot play speech here.',
+    speakBlocked: 'The browser blocked playback; click anywhere on the page and try again.',
+    voiceLoop: 'Handsfree conversation: listen after every reply and send what I say',
+    voiceLoopHint: 'While this is on the microphone reopens by itself once a reply has been read out, and a finished transcript is submitted without a click. Switching it off releases the microphone.',
+    voiceStart: 'Start handsfree conversation',
+    voiceStop: 'Stop handsfree conversation',
+    voiceListening: 'listening',
+    voiceThinking: 'thinking',
+    voiceSpeaking: 'speaking',
+    voicePaused: 'paused, click to resume',
+    voiceHeardNothing: 'nothing was said, click to listen again',
+    voice: 'Voice',
+    voiceCustom: 'Custom voice id...',
+    voiceLive: 'from the MiniMax account',
+    voiceBuiltin: 'built-in list',
+    voiceCustomId: 'Custom voice id',
     credential: 'Credential',
     credentialConfigured: 'configured',
     credentialMissing: 'not configured',
@@ -128,6 +230,38 @@ var DICTIONARIES = {
     maxRecordSeconds: '录音时长上限（秒）',
     maxFileMB: '文件大小上限（MB）',
     timeoutMs: '请求超时（毫秒）',
+    speakEnabled: '任务结束后用喇叭朗读结果',
+    ttsModel: '语音模型',
+    ttsVoice: '音色',
+    ttsSpeed: '语速',
+    speakMaxChars: '朗读字数上限',
+    speakTest: '试听音色',
+    speakTesting: '合成中…',
+    speakSample: '任务完成之后，我会这样把结果念给你听。',
+    speech: '朗读',
+    speakIdle: '已关闭',
+    speakReady: '就绪',
+    speakListening: '监听中',
+    speakSaying: '正在朗读',
+    speakError: '失败',
+    speakToggleOn: '开启语音播报',
+    speakToggleOff: '关闭语音播报',
+    speakUnsupported: '当前浏览器无法播放语音。',
+    speakBlocked: '浏览器拦截了自动播放，请在页面任意处点击一次后重试。',
+    voiceLoop: '实时对话：每轮回复念完后自动开麦，我说完就自动发送',
+    voiceLoopHint: '开启后，播报结束时麦克风会自己打开，检测到你说完就自动转写并发送，全程不用点按钮；关闭会立刻释放麦克风。',
+    voiceStart: '开始实时对话',
+    voiceStop: '结束实时对话',
+    voiceListening: '正在听你说',
+    voiceThinking: '思考中',
+    voiceSpeaking: '正在念回复',
+    voicePaused: '已暂停，点一下继续',
+    voiceHeardNothing: '没听到声音，点一下重新听',
+    voice: '音色',
+    voiceCustom: '自定义音色 ID…',
+    voiceLive: '来自 MiniMax 账号',
+    voiceBuiltin: '内置列表',
+    voiceCustomId: '自定义音色 ID',
     credential: '凭据',
     credentialConfigured: '已配置',
     credentialMissing: '未配置',
@@ -193,11 +327,15 @@ function owns(object, key) {
  * Bridges the `minimax-asr` settings scope and the credentials domain onto the
  * card, publishing one plain snapshot the renderer binds as `useCard`.
  * @param ctx - the browser plugin context.
+ * @param speech - the speech controller, so the card can show its state and
+ * play a sample line.
  */
-function CardController(ctx) {
+function CardController(ctx, speech) {
   this.ctx = ctx
+  this.speech = speech
   this.scope = ctx.settingsScope.bind({ namespace: NS })
   this.credential = { ref: DEFAULT_CREDENTIAL_REF, configured: false, known: false }
+  this.voices = { status: 'loading', source: '', list: [] }
   this.saving = false
   this.failed = false
   var self = this
@@ -206,7 +344,13 @@ function CardController(ctx) {
     self.syncCredential()
     self.publish()
   })
+  // The card shows the switch's live state (listening / speaking), so a change
+  // made from the composer control re-renders it too.
+  this.offSpeech = speech === undefined
+    ? undefined
+    : speech.store.subscribe(function () { self.publish() })
   this.readCredential()
+  this.loadVoices()
 }
 
 /** The card's whole published state. */
@@ -224,7 +368,34 @@ CardController.prototype.build = function () {
     credentialKnown: this.credential.known,
     saving: this.saving,
     failed: this.failed,
+    speech: this.speech === undefined ? undefined : this.speech.store.getSnapshot(),
+    voices: this.voices,
   }
+}
+
+/**
+ * Ask the host for the account's voice catalogue. A failure is not a failure of
+ * the card: the picker falls back to the free-text field.
+ */
+CardController.prototype.loadVoices = function () {
+  var self = this
+  if (typeof fetch !== 'function') {
+    this.voices = { status: 'failed', source: '', list: [] }
+    return
+  }
+  fetch(VOICES_ROUTE).then(function (response) {
+    return response.json().then(function (body) { return { status: response.status, body: body } })
+  }).then(function (result) {
+    var body = result.body
+    var list = body !== null && typeof body === 'object' && Array.isArray(body.voices) ? body.voices : []
+    self.voices = result.status === 200 && list.length > 0
+      ? { status: 'ready', source: typeof body.source === 'string' ? body.source : '', list: list }
+      : { status: 'failed', source: '', list: [] }
+    self.publish()
+  }).catch(function () {
+    self.voices = { status: 'failed', source: '', list: [] }
+    self.publish()
+  })
 }
 
 CardController.prototype.publish = function () {
@@ -291,11 +462,32 @@ CardController.prototype.inject = function () {
   return {
     hooks: { card: this.store },
     save: function (ops) { return self.save(ops) },
+    say: function (text, options) {
+      if (self.speech !== undefined) self.speech.tryVoice(text, options)
+    },
+    toggleSpeech: function () {
+      if (self.speech !== undefined) self.speech.toggle()
+    },
+    // Opening the card is the natural moment to retry a catalogue the host
+    // could not serve earlier — a deployment restarted after the page loaded,
+    // for instance — so the picker appears without a page reload. The guard
+    // reads what the card is actually showing.
+    loadVoices: function () {
+      var shown = self.store.getSnapshot().voices
+      if (shown === null || typeof shown !== 'object' || shown.status !== 'failed') return
+      self.voices = { status: 'loading', source: '', list: [] }
+      self.publish()
+      self.loadVoices()
+    },
   }
 }
 
 CardController.prototype.dispose = function () {
   this.off()
+  if (this.offSpeech !== undefined) {
+    this.offSpeech()
+    this.offSpeech = undefined
+  }
 }
 
 var cardStyle = {
@@ -317,6 +509,14 @@ var labelStyle = { display: 'flex', alignItems: 'center', gap: '6px' }
 var inputStyle = { minWidth: '16rem', padding: '4px 6px' }
 var badgeStyle = { fontSize: '11px', border: '1px solid currentColor', borderRadius: '999px', padding: '0 6px' }
 var hintStyle = { opacity: 0.6, fontSize: '11px' }
+var headingStyle = {
+  marginTop: '10px',
+  paddingTop: '8px',
+  borderTop: '1px solid var(--dsw-color-border, #d0d5dd)',
+  fontSize: '12px',
+  fontWeight: 600,
+  opacity: 0.8,
+}
 var footerStyle = { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '8px', paddingTop: '8px' }
 
 /**
@@ -375,6 +575,10 @@ function MinimaxAsrCard(props) {
         if (owns(user, field)) ops.push({ op: 'unset', path: [field] })
         continue
       }
+      if (BOOL_FIELDS[field] === true) {
+        ops.push({ op: 'set', path: [field], value: text === 'true' })
+        continue
+      }
       if (NUMERIC_FIELDS[field] === true) {
         var numeric = Number(text)
         if (!isFinite(numeric)) continue
@@ -419,8 +623,217 @@ function MinimaxAsrCard(props) {
     )
   }
 
+  // The spoken-announcement half: a switch, its live state, and a sample line,
+  // kept in one block so the settings above stay about transcription.
+  var speech = state.speech !== null && typeof state.speech === 'object' ? state.speech : undefined
+  var speakEnabled = (function () {
+    var current = shown('speakEnabled')
+    // The host default is on, so a section that names nothing means "on".
+    return current === '' ? true : current === 'true'
+  })()
+
+  var speechHeadingRow = function () {
+    return React.createElement('div', { key: 'speech-heading', style: headingStyle }, t('speech'))
+  }
+
+  var speakToggleRow = function () {
+    var overridden = owns(user, 'speakEnabled')
+    return React.createElement('div', { key: 'speakEnabled', style: rowStyle },
+      React.createElement('div', { style: labelStyle },
+        React.createElement('label', { htmlFor: 'minimax-asr-speakEnabled' }, t('speakEnabled')),
+        overridden ? React.createElement('span', { style: badgeStyle }, t('overridden')) : null,
+        overridden
+          ? React.createElement('button', {
+            type: 'button',
+            disabled: busy || !writable,
+            onClick: function () { edit('speakEnabled', '') },
+          }, t('reset'))
+          : null,
+      ),
+      React.createElement('input', {
+        id: 'minimax-asr-speakEnabled',
+        type: 'checkbox',
+        checked: speakEnabled,
+        disabled: busy || !writable,
+        onChange: function (event) { edit('speakEnabled', event.currentTarget.checked ? 'true' : 'false') },
+      }),
+    )
+  }
+
+  var speechStateRow = function () {
+    return React.createElement('div', { key: 'speech-state', style: rowStyle },
+      React.createElement('div', { style: labelStyle },
+        React.createElement('span', null, t('speech')),
+        speech !== undefined && typeof speech.voice === 'string' && speech.voice.length > 0
+          ? React.createElement('span', { style: hintStyle }, speech.voice)
+          : null,
+        speech !== undefined && speech.status === 'error' && typeof speech.error === 'string'
+          ? React.createElement('span', { style: hintStyle },
+            speech.error === 'blocked' ? t('speakBlocked') : speech.error)
+          : null,
+      ),
+      React.createElement('div', { style: labelStyle },
+        React.createElement('span', { style: badgeStyle }, t(speechStatusKey(speech))),
+        React.createElement('button', {
+          type: 'button',
+          disabled: busy || speech === undefined || speech.supported !== true,
+          // Auditioning uses whatever the picker currently shows, saved or not.
+          onClick: function () {
+            props.say(t('speakSample'), { voice: spokenVoice(), speed: spokenSpeed() })
+          },
+        }, t('speakTest')),
+      ),
+    )
+  }
+
+  // --- the voice picker -----------------------------------------------------
+  // The host serves the account's whole catalogue (303 system voices when the
+  // request succeeds), grouped by language; an id that is not in it - a cloned
+  // voice, or a catalogue the host could not fetch - keeps the text field.
+  var voiceCatalogue = state.voices !== null && typeof state.voices === 'object' ? state.voices : {}
+  var voiceList = Array.isArray(voiceCatalogue.list) ? voiceCatalogue.list : []
+  var customPair = React.useState(false)
+  var customWanted = customPair[0]
+  var setCustomWanted = customPair[1]
+  /** The voice the next synthesis would use, draft included. */
+  var spokenVoice = function () { return shown('ttsVoice') || DEFAULT_VOICE }
+  /** The staged rate, so an audition hears the rate it would save. */
+  var spokenSpeed = function () {
+    var declared = Number(shown('ttsSpeed'))
+    return isFinite(declared) && declared > 0 ? declared : 1
+  }
+
+  var voiceRow = function () {
+    var current = spokenVoice()
+    var listed = false
+    for (var index = 0; index < voiceList.length; index += 1) {
+      if (voiceList[index].id === current) listed = true
+    }
+    var custom = customWanted || (voiceList.length > 0 && !listed)
+    var overridden = owns(user, 'ttsVoice')
+    var children = []
+    if (voiceList.length > 0) {
+      var groups = []
+      var seen = {}
+      for (var v = 0; v < voiceList.length; v += 1) {
+        var group = typeof voiceList[v].group === 'string' && voiceList[v].group.length > 0 ? voiceList[v].group : '其它'
+        if (seen[group] === undefined) {
+          seen[group] = []
+          groups.push(group)
+        }
+        seen[group].push(voiceList[v])
+      }
+      var options = []
+      for (var g = 0; g < groups.length; g += 1) {
+        var items = seen[groups[g]].map(function (voice) {
+          return React.createElement('option', { key: voice.id, value: voice.id }, voice.id + ' · ' + voice.name)
+        })
+        options.push(React.createElement('optgroup', { key: groups[g], label: groups[g] }, items))
+      }
+      options.push(React.createElement('option', { key: '__custom__', value: '__custom__' }, t('voiceCustom')))
+      children.push(React.createElement('select', {
+        key: 'select',
+        id: 'minimax-asr-ttsVoice',
+        style: inputStyle,
+        value: custom ? '__custom__' : current,
+        disabled: busy || !writable,
+        onChange: function (event) {
+          var next = event.currentTarget.value
+          if (next === '__custom__') {
+            setCustomWanted(true)
+            return
+          }
+          setCustomWanted(false)
+          edit('ttsVoice', next)
+        },
+      }, options))
+    }
+    if (custom || voiceList.length === 0) {
+      children.push(React.createElement('input', {
+        key: 'custom',
+        id: 'minimax-asr-ttsVoice-custom',
+        type: 'text',
+        style: inputStyle,
+        placeholder: DEFAULT_VOICE,
+        value: shown('ttsVoice'),
+        disabled: busy || !writable,
+        onChange: function (event) { edit('ttsVoice', event.currentTarget.value) },
+      }))
+    }
+    return React.createElement('div', { key: 'ttsVoice', style: rowStyle },
+      React.createElement('div', { style: labelStyle },
+        React.createElement('label', { htmlFor: 'minimax-asr-ttsVoice' }, t('voice')),
+        overridden ? React.createElement('span', { style: badgeStyle }, t('overridden')) : null,
+        voiceList.length > 0
+          ? React.createElement('span', { style: hintStyle },
+            voiceList.length + ' · ' + t(voiceCatalogue.source === 'builtin' ? 'voiceBuiltin' : 'voiceLive'))
+          : null,
+        overridden
+          ? React.createElement('button', {
+            type: 'button',
+            disabled: busy || !writable,
+            onClick: function () { edit('ttsVoice', '') },
+          }, t('reset'))
+          : null,
+      ),
+      React.createElement('div', { style: labelStyle }, children),
+    )
+  }
+
+  // --- the handsfree switch -------------------------------------------------
+  var loopToggleRow = function () {
+    var speechOn = speech !== undefined && speech.supported === true
+    var on = speech !== undefined && speech.loop === true
+    var overridden = owns(user, 'voiceLoop')
+    var note = !speechOn
+      ? t('speakUnsupported')
+      : speech.loopNote === 'heard-nothing' ? t('voiceHeardNothing')
+        : speech.loopNote === 'no-microphone' ? t('micUnsupported')
+          : speech.loopNote === 'mic-failed' ? t('micFailed')
+            : t('voiceLoopHint')
+    return React.createElement('div', { key: 'voiceLoop', style: rowStyle },
+      React.createElement('div', { style: labelStyle },
+        React.createElement('label', { htmlFor: 'minimax-asr-voiceLoop' }, t('voiceLoop')),
+        overridden ? React.createElement('span', { style: badgeStyle }, t('overridden')) : null,
+        React.createElement('span', { style: hintStyle }, note),
+        overridden
+          ? React.createElement('button', {
+            type: 'button',
+            disabled: busy || !writable,
+            onClick: function () { edit('voiceLoop', '') },
+          }, t('reset'))
+          : null,
+      ),
+      React.createElement('input', {
+        id: 'minimax-asr-voiceLoop',
+        type: 'checkbox',
+        checked: (function () {
+          var current = shown('voiceLoop')
+          return current === '' ? false : current === 'true'
+        })(),
+        disabled: busy || !writable || !speechOn,
+        onChange: function (event) { edit('voiceLoop', event.currentTarget.checked ? 'true' : 'false') },
+      }),
+    )
+  }
+
   var rows = []
-  for (var i = 0; i < FIELDS.length; i += 1) rows.push(fieldRow(FIELDS[i]))
+  var speechStarted = false
+  for (var i = 0; i < FIELDS.length; i += 1) {
+    if (FIELDS[i].key === 'speakEnabled' && !speechStarted) {
+      speechStarted = true
+      rows.push(speechHeadingRow())
+      rows.push(speakToggleRow())
+      rows.push(speechStateRow())
+      continue
+    }
+    if (FIELDS[i].key === 'ttsVoice') {
+      rows.push(voiceRow())
+      continue
+    }
+    rows.push(fieldRow(FIELDS[i]))
+  }
+  rows.push(loopToggleRow())
 
   rows.push(React.createElement('div', { key: 'credential', style: rowStyle },
     React.createElement('div', { style: labelStyle },
@@ -453,7 +866,10 @@ function MinimaxAsrCard(props) {
       type: 'button',
       'aria-expanded': open,
       style: headerStyle,
-      onClick: function () { setOpen(!open) },
+      onClick: function () {
+        if (!open && typeof props.loadVoices === 'function') props.loadVoices()
+        setOpen(!open)
+      },
     },
       React.createElement('span', { style: { flex: 1 } },
         React.createElement('span', { style: titleStyle }, t('title')),
@@ -568,9 +984,53 @@ function encodeWav(samples, sampleRate) {
   return buffer
 }
 
+/**
+ * Attach a level analyser to a live microphone stream.
+ * @param stream - the microphone stream.
+ * @returns the analyser handle, or null when the browser has no Web Audio.
+ */
+function createLevelMeter(stream) {
+  var Ctor = typeof window === 'undefined' ? undefined : window.AudioContext || window.webkitAudioContext
+  if (typeof Ctor !== 'function' || typeof stream === 'undefined' || stream === null) return null
+  try {
+    var context = new Ctor()
+    var source = context.createMediaStreamSource(stream)
+    var analyser = context.createAnalyser()
+    analyser.fftSize = 2048
+    source.connect(analyser)
+    return {
+      context: context,
+      analyser: analyser,
+      buffer: new Float32Array(analyser.fftSize),
+      /** Root-mean-square level of the newest frame. */
+      level: function () {
+        analyser.getFloatTimeDomainData(this.buffer)
+        var sum = 0
+        for (var i = 0; i < this.buffer.length; i += 1) sum += this.buffer[i] * this.buffer[i]
+        return Math.sqrt(sum / this.buffer.length)
+      },
+      close: function () {
+        try {
+          source.disconnect()
+        } catch (error) {
+          // Already detached.
+        }
+        if (typeof context.close === 'function') {
+          try {
+            context.close()
+          } catch (error) {
+            // Already closed.
+          }
+        }
+      },
+    }
+  } catch (error) {
+    return null
+  }
+}
+
 /** Append a transcript to the draft the user already typed. */
-function mergeDraft(draft, addition) {
-  var current = typeof draft === 'string' ? draft : ''
+function mergeDraft(draft, addition) {  var current = typeof draft === 'string' ? draft : ''
   var text = typeof addition === 'string' ? addition.trim() : ''
   if (text.length === 0) return current
   if (current.trim().length === 0) return text
@@ -595,12 +1055,34 @@ function MicController(ctx) {
     textSeq: 0,
     supported: recordingSupported(),
     limitSeconds: this.limitSeconds(),
+    /** True while the microphone is open because the handsfree loop asked. */
+    handsfree: false,
+    /** Whether anything above the gate has been heard in this recording. */
+    heard: false,
+    /** Newest measured level and the gate it is compared against. */
+    level: 0,
+    gate: 0,
   })
   this.recorder = null
   this.stream = null
   this.chunks = []
   this.timer = null
   this.startedAt = 0
+  // Handsfree listening state: the level meter, its frame clock, and what the
+  // gate has seen so far.
+  this.meter = null
+  this.vadTimer = null
+  this.vad = false
+  /** True while this recording belongs to the handsfree loop. */
+  this.handsfree = false
+  /** Bumped to invalidate an in-flight `getUserMedia` request. */
+  this.requestSeq = 0
+  this.floor = null
+  this.heardFrames = 0
+  this.quietSince = 0
+  this.loudest = 0
+  this.lastReport = 0
+  this.abandoned = false
   var self = this
   // A committed settings change re-publishes the cap; a recording already
   // running keeps the length it started with, which is the least surprising.
@@ -640,14 +1122,198 @@ MicController.prototype.toggle = function () {
   this.start()
 }
 
+/**
+ * Open the microphone and record handsfree: the level gate ends the turn, so
+ * nothing is clicked. Nothing said for {@link VAD_IDLE_MS} releases the
+ * microphone without uploading an empty recording.
+ * @returns whether listening began.
+ */
+MicController.prototype.listen = function (options) {
+  var status = this.store.getSnapshot().status
+  var override = options !== undefined && options.force === true
+  if (status === 'recording' && override !== true) return false
+  if (status === 'transcribing' || status === 'starting') return false
+  if (this.store.getSnapshot().supported !== true) return false
+  this.vad = true
+  this.handsfree = true
+  this.abandoned = false
+  this.floor = null
+  this.heardFrames = 0
+  this.quietSince = 0
+  this.loudest = 0
+  this.publish({ handsfree: true, heard: false, level: 0, gate: 0, silent: false })
+  this.start()
+  return true
+}
+
+/**
+ * Give up on a handsfree recording without uploading anything: used when the
+ * loop is switched off or the microphone is needed for something else.
+ */
+MicController.prototype.release = function () {
+  if (this.vad !== true && this.store.getSnapshot().handsfree !== true) return
+  this.vad = false
+  this.handsfree = false
+  this.abandoned = true
+  // A microphone that is still opening must not survive this call.
+  this.requestSeq += 1
+  this.stopMeter()
+  var recorder = this.recorder
+  this.recorder = null
+  this.chunks = []
+  if (this.timer !== null) {
+    clearInterval(this.timer)
+    this.timer = null
+  }
+  if (recorder !== null && recorder.state !== 'inactive') {
+    try {
+      recorder.onstop = null
+      recorder.stop()
+    } catch (error) {
+      // Already stopped.
+    }
+  }
+  this.releaseStream()
+  this.publish({ status: 'idle', seconds: 0, handsfree: false, heard: false })
+}
+
+/** Stop the level meter and its frame clock. */
+MicController.prototype.stopMeter = function () {
+  if (this.vadTimer !== null) {
+    clearInterval(this.vadTimer)
+    this.vadTimer = null
+  }
+  if (this.meter !== null) {
+    this.meter.close()
+    this.meter = null
+  }
+}
+
+/** Drop the "nothing was heard" marker, so the loop can open the mic again. */
+MicController.prototype.clearSilence = function () {
+  if (this.store.getSnapshot().silent !== true) return
+  this.publish({ silent: false })
+}
+
+/**
+ * Start the gate that decides when a handsfree turn has ended.
+ *
+ * A quiet built-in microphone array reports levels far below what a naive
+ * threshold expects, so the gate adapts: the first frames measure the room, and
+ * speech has to clear both that floor and a low absolute minimum. The measured
+ * numbers go to the host's diagnostics route, so a mis-tuned gate can be seen
+ * from outside the browser.
+ */
+MicController.prototype.startMeter = function () {
+  var self = this
+  this.meter = createLevelMeter(this.stream)
+  if (this.meter === null) {
+    // Without Web Audio the gate cannot run: fall back to the configured cap.
+    this.publish({ error: null })
+    return
+  }
+  this.vadTimer = setInterval(function () {
+    var level = self.meter === null ? 0 : self.meter.level()
+    var now = Date.now()
+    var elapsed = now - self.startedAt
+    // The floor is only ever learned from frames that are *not* speech, so a
+    // turn that begins loudly cannot raise the gate above the speaker's own
+    // voice (which would make the loop deaf for the rest of the window).
+    var reference = self.floor === null ? VAD_MIN_RMS : self.floor
+    var gate = Math.min(VAD_MAX_GATE, Math.max(VAD_MIN_RMS, reference * VAD_FLOOR_FACTOR))
+    if (elapsed >= VAD_SETTLE_MS) {
+      if (level > gate) {
+        self.heardFrames += 1
+        self.quietSince = 0
+        if (level > self.loudest) self.loudest = level
+      } else {
+        self.floor = self.floor === null ? level : Math.min(self.floor, level)
+        if (self.heardFrames > 0 && self.quietSince === 0) self.quietSince = now
+        self.heardFrames = 0
+      }
+    }
+    var spoken = self.store.getSnapshot().heard === true || self.loudest > gate
+    self.publish({
+      level: Number(level.toFixed(5)),
+      gate: Number(gate.toFixed(5)),
+      heard: spoken,
+      seconds: Math.floor(elapsed / 1000),
+    })
+    if (now - self.lastReport >= VAD_REPORT_MS) {
+      self.lastReport = now
+      reportEvent({
+        event: 'mic-level',
+        level: Number(level.toFixed(5)),
+        floor: self.floor === null ? null : Number(self.floor.toFixed(5)),
+        gate: Number(gate.toFixed(5)),
+        loudest: Number(self.loudest.toFixed(5)),
+        heard: spoken,
+        seconds: Math.floor(elapsed / 1000),
+      })
+    }
+    if (spoken && self.quietSince !== 0 && now - self.quietSince >= VAD_SILENCE_MS) {
+      // Said something, then stopped: that is the end of the turn.
+      self.stop()
+      return
+    }
+    if (spoken && elapsed >= VAD_MAX_TURN_MS) {
+      self.stop()
+      return
+    }
+    if (!spoken && elapsed >= VAD_IDLE_MS) {
+      // Nothing was said; release the microphone rather than upload silence.
+      reportEvent({ event: 'mic-idle-timeout', seconds: Math.round(elapsed / 1000) })
+      self.vad = false
+      self.handsfree = false
+      self.abandoned = true
+      self.stopMeter()
+      if (self.timer !== null) {
+        clearInterval(self.timer)
+        self.timer = null
+      }
+      var idleRecorder = self.recorder
+      self.recorder = null
+      self.chunks = []
+      if (idleRecorder !== null && idleRecorder.state !== 'inactive') {
+        try {
+          idleRecorder.onstop = null
+          idleRecorder.stop()
+        } catch (error) {
+          // Already stopped.
+        }
+      }
+      self.releaseStream()
+      self.publish({ status: 'idle', seconds: 0, handsfree: false, heard: false, silent: true })
+    }
+  }, VAD_FRAME_MS)
+}
+
 /** Open the microphone and begin recording. */
 MicController.prototype.start = function () {
   var self = this
   if (this.store.getSnapshot().supported !== true) return
   this.publish({ status: 'starting', error: null, seconds: 0 })
+  // `getUserMedia` can resolve after the microphone was already released; this
+  // generation counter is what makes a late answer harmless.
+  this.requestSeq += 1
+  var request = this.requestSeq
   navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   }).then(function (stream) {
+    if (request !== self.requestSeq) {
+      // The microphone was cancelled while the permission/stream was in flight.
+      if (stream !== null && typeof stream.getTracks === 'function') {
+        var late = stream.getTracks()
+        for (var index = 0; index < late.length; index += 1) {
+          try {
+            late[index].stop()
+          } catch (error) {
+            // Already stopped.
+          }
+        }
+      }
+      return
+    }
     self.stream = stream
     self.chunks = []
     var options = {}
@@ -667,13 +1333,24 @@ MicController.prototype.start = function () {
     // Read the cap once, at start: a settings change mid-recording must not
     // silently cut a recording the user is still speaking into.
     var limit = self.limitSeconds()
-    self.publish({ status: 'recording', seconds: 0, error: null, limitSeconds: limit })
+    self.publish({
+      status: 'recording',
+      seconds: 0,
+      error: null,
+      limitSeconds: limit,
+      handsfree: self.vad === true,
+      heard: false,
+    })
     self.timer = setInterval(function () {
       var seconds = Math.floor((Date.now() - self.startedAt) / 1000)
-      self.publish({ seconds: seconds })
+      if (self.vad !== true) self.publish({ seconds: seconds })
       if (seconds >= limit) self.stop()
     }, 500)
+    if (self.vad === true) self.startMeter()
   }, function (error) {
+    self.vad = false
+    self.stopMeter()
+    self.publish({ handsfree: false })
     self.fail(error !== null && typeof error === 'object' && typeof error.message === 'string'
       ? error
       : new Error('microphone permission was refused'))
@@ -682,6 +1359,8 @@ MicController.prototype.start = function () {
 
 /** Stop recording; the recorder's own `onstop` continues into transcription. */
 MicController.prototype.stop = function () {
+  this.vad = false
+  this.stopMeter()
   if (this.timer !== null) {
     clearInterval(this.timer)
     this.timer = null
@@ -705,9 +1384,25 @@ MicController.prototype.finish = function () {
   var recorder = this.recorder
   var type = recorder !== null && recorder.mimeType ? recorder.mimeType : 'audio/webm'
   var blob = new Blob(this.chunks, { type: type })
+  var handsfree = this.handsfree === true
   this.recorder = null
   this.chunks = []
+  this.handsfree = false
   this.releaseStream()
+  // A handsfree window that heard nothing must never reach the endpoint: the
+  // user pausing to think is not an empty message, and the cap firing on a
+  // silent window is the same situation.
+  if (this.abandoned === true || (handsfree === true && this.store.getSnapshot().heard !== true)) {
+    this.abandoned = false
+    this.publish({
+      status: 'idle',
+      seconds: 0,
+      handsfree: false,
+      heard: false,
+      silent: handsfree,
+    })
+    return
+  }
   if (blob.size === 0) {
     this.fail(new Error('nothing was recorded'))
     return
@@ -738,6 +1433,8 @@ MicController.prototype.finish = function () {
         error: null,
         text: typeof body.text === 'string' ? body.text : '',
         textSeq: self.store.getSnapshot().textSeq + 1,
+        handsfree: false,
+        heard: false,
       })
     })
     .catch(function (error) { self.fail(error) })
@@ -760,6 +1457,10 @@ MicController.prototype.releaseStream = function () {
 
 /** Publish a failure and drop every recording resource. */
 MicController.prototype.fail = function (error) {
+  this.vad = false
+  this.handsfree = false
+  this.requestSeq += 1
+  this.stopMeter()
   if (this.timer !== null) {
     clearInterval(this.timer)
     this.timer = null
@@ -770,6 +1471,8 @@ MicController.prototype.fail = function (error) {
   this.publish({
     status: 'error',
     seconds: 0,
+    handsfree: false,
+    heard: false,
     error: error !== null && typeof error === 'object' && typeof error.message === 'string'
       ? error.message
       : String(error),
@@ -782,6 +1485,9 @@ MicController.prototype.dispose = function () {
     this.offScope()
     this.offScope = undefined
   }
+  this.vad = false
+  this.abandoned = true
+  this.stopMeter()
   if (this.timer !== null) {
     clearInterval(this.timer)
     this.timer = null
@@ -799,11 +1505,642 @@ MicController.prototype.dispose = function () {
   this.releaseStream()
 }
 
-MicController.prototype.inject = function () {
+MicController.prototype.inject = function (speech) {
   var self = this
   return {
-    hooks: { mic: this.store },
+    hooks: {
+      mic: this.store,
+      // The handsfree loop owns the transcript while it is on: this control
+      // must not also paste it into the draft.
+      speech: speech === undefined ? undefined : speech.store,
+    },
     toggle: function () { self.toggle() },
+  }
+}
+
+// --- speech: the host talks back -------------------------------------------
+
+/** Whether this browser can play synthesised speech at all. */
+function speechSupported() {
+  return typeof window !== 'undefined'
+    && typeof window.EventSource === 'function'
+    && typeof window.Audio === 'function'
+    && typeof URL !== 'undefined'
+    && typeof URL.createObjectURL === 'function'
+}
+
+/**
+ * Plays the host's announcements through the speakers, and — in loop mode —
+ * runs the whole handsfree conversation with the microphone controller.
+ *
+ * The host pushes one frame per finished turn on the announcement stream; this
+ * half turns each frame into audio and plays it, so a turn that ends while the
+ * user is looking elsewhere still arrives. Playback is queued rather than
+ * overlapped, and turning the feature off stops whatever is playing.
+ * @param ctx - the browser plugin context, for the settings scope.
+ * @param mic - the microphone controller the loop drives.
+ */
+function SpeechController(ctx, mic) {
+  this.scope = ctx === undefined || ctx.settingsScope === undefined
+    ? undefined
+    : ctx.settingsScope.bind({ namespace: NS })
+  this.mic = mic
+  this.stream = null
+  this.audio = null
+  this.objectURL = null
+  this.queue = []
+  this.playing = false
+  // Settles an in-flight playback when it is interrupted, so a paused element
+  // (which fires no `ended`) cannot leave the controller thinking it is busy.
+  this.abort = null
+  // Set by the toggle so the control reacts before the host round-trip lands.
+  this.override = null
+  this.loopOverride = null
+  // Re-entrancy guards for the handsfree machine; both stores notify on write.
+  this.syncing = false
+  this.arming = false
+  // Pending reopen of a refused announcement stream; see open().
+  this.retry = null
+  // The mounted session's composer, handed over by the composer control.
+  this.input = null
+  // Transcripts that arrived before this controller existed are not ours.
+  this.lastSubmittedSeq = mic === undefined ? 0 : mic.store.getSnapshot().textSeq
+  this.store = store.createSnapshotStore({
+    enabled: this.enabled(),
+    status: 'idle',
+    error: null,
+    heard: 0,
+    spoken: 0,
+    dropped: 0,
+    pending: 0,
+    connected: false,
+    supported: speechSupported(),
+    voice: this.voice(),
+    lastText: '',
+    /** Handsfree conversation mode. */
+    loop: false,
+    /** off | listening | thinking | speaking | paused */
+    stage: 'off',
+    /** The last transcript the loop submitted, for the control's tooltip. */
+    lastHeard: '',
+    /** Why the loop paused, if it did. */
+    loopNote: null,
+    /** How many exchanges this page has completed. */
+    exchanges: 0,
+  })
+  var self = this
+  this.offScope = this.scope === undefined
+    ? undefined
+    : this.scope.subscribe(function () { self.onSectionChange() })
+  this.offMic = mic === undefined
+    ? undefined
+    : mic.store.subscribe(function () { self.onMicChange() })
+  if (this.enabled()) this.open()
+}
+
+/** Whether announcements should be spoken right now. */
+SpeechController.prototype.enabled = function () {
+  if (this.override !== null) return this.override
+  if (this.scope === undefined) return true
+  var value = this.scope.getSnapshot().value
+  if (value === null || typeof value !== 'object') return true
+  return value.speakEnabled !== false
+}
+
+/**
+ * Whether handsfree conversation mode is on. The loop needs a voice, so it
+ * implies announcements whether or not that switch is separately on.
+ */
+SpeechController.prototype.loopEnabled = function () {
+  if (this.loopOverride !== null) return this.loopOverride
+  if (this.scope === undefined) return false
+  var value = this.scope.getSnapshot().value
+  if (value === null || typeof value !== 'object') return false
+  return value.voiceLoop === true
+}
+
+/** Whether announcements are spoken, counting a running loop as consent. */
+SpeechController.prototype.speaks = function () {
+  return this.enabled() === true || this.loopEnabled() === true
+}
+
+/** The configured voice, for the tooltip. */
+SpeechController.prototype.voice = function () {
+  var value = this.scope === undefined ? undefined : this.scope.getSnapshot().value
+  var declared = value !== null && typeof value === 'object' ? value.ttsVoice : undefined
+  return typeof declared === 'string' && declared.length > 0 ? declared : DEFAULT_VOICE
+}
+
+/**
+ * A committed section change re-reads the switches. An override the host has
+ * since agreed with is dropped, so the host stays authoritative.
+ */
+SpeechController.prototype.onSectionChange = function () {
+  var value = this.scope.getSnapshot().value
+  var committedEnabled = value !== null && typeof value === 'object' ? value.speakEnabled : undefined
+  if (this.override !== null && committedEnabled === this.override) this.override = null
+  var committedLoop = value !== null && typeof value === 'object' ? value.voiceLoop : undefined
+  if (this.loopOverride !== null && committedLoop === this.loopOverride) this.loopOverride = null
+
+  var enabled = this.speaks()
+  this.publish({ enabled: enabled, voice: this.voice() })
+  if (enabled) this.open()
+  else this.stop()
+  this.syncLoop()
+}
+
+/** Publish a patch over the current snapshot. */
+SpeechController.prototype.publish = function (patch) {
+  var current = this.store.getSnapshot()
+  var next = {}
+  for (var key in current) if (Object.prototype.hasOwnProperty.call(current, key)) next[key] = current[key]
+  for (var patchKey in patch) if (Object.prototype.hasOwnProperty.call(patch, patchKey)) next[patchKey] = patch[patchKey]
+  this.store.set(next)
+}
+
+/**
+ * The composer control hands over the mounted session's input actions, which is
+ * the only way this half can submit a spoken message. Registered on mount and
+ * dropped on unmount, so a handed-over session never outlives its control.
+ * @param actions - `{ setDraft, submit, sessionId }`, or null to detach.
+ */
+SpeechController.prototype.attachInput = function (actions) {
+  this.input = actions
+  this.syncLoop()
+}
+
+/** The transcript the microphone just produced, if the loop owns it. */
+SpeechController.prototype.onMicChange = function () {
+  var mic = this.mic === undefined ? undefined : this.mic.store.getSnapshot()
+  if (mic === undefined) return
+  if (mic.textSeq > this.lastSubmittedSeq) {
+    this.lastSubmittedSeq = mic.textSeq
+    var text = typeof mic.text === 'string' ? mic.text.trim() : ''
+    if (text.length > 0) {
+      this.publish({ lastHeard: text, exchanges: this.store.getSnapshot().exchanges + 1 })
+      if (this.loopEnabled() === true) this.submitTranscript(text)
+    }
+  }
+  this.syncLoop()
+}
+
+/**
+ * Submit one spoken message: the loop replaces the draft rather than merging,
+ * so an auto-sent message never carries along text the user typed earlier.
+ * @param text - the transcript.
+ */
+SpeechController.prototype.submitTranscript = function (text) {
+  var actions = this.input
+  this.publish({ stage: 'thinking', loopNote: null })
+  if (actions === null || typeof actions.setDraft !== 'function' || typeof actions.submit !== 'function') {
+    this.publish({ loopNote: 'no-session', stage: 'paused' })
+    reportEvent({ event: 'voice-submit-failed', error: 'no session composer is mounted' })
+    return
+  }
+  actions.setDraft(text)
+  reportEvent({ event: 'voice-submitted', chars: text.length, sessionId: actions.sessionId })
+  // One macrotask later, so the editor binding has certainly taken the write.
+  window.setTimeout(function () {
+    try {
+      actions.submit()
+    } catch (error) {
+      reportEvent({ event: 'voice-submit-failed', error: String(error && error.message) })
+    }
+  }, 0)
+}
+
+/** Turn the loop on or off, persisting the switch when the host is writable. */
+SpeechController.prototype.toggleLoop = function () {
+  var self = this
+  if (this.store.getSnapshot().supported !== true) return
+  var next = this.loopEnabled() !== true
+  this.loopOverride = next
+  // A fresh start must not inherit the previous pause. Switching *off* leaves
+  // the old state on purpose: that is what tells the loop to release the
+  // microphone on its way out.
+  this.publish(next ? { loop: true, loopNote: null, stage: 'listening' } : { loopNote: null })
+  this.syncLoop()
+  if (this.scope === undefined) return
+  var snapshot = this.scope.getSnapshot()
+  if (snapshot.writable !== true || snapshot.mode !== 'host') return
+  var ops = [{ op: 'set', path: ['voiceLoop'], value: next }]
+  // The loop cannot hear anything it does not speak, so switching it on turns
+  // announcements on in the same write.
+  if (next === true && this.enabled() !== true) ops.push({ op: 'set', path: ['speakEnabled'], value: true })
+  snapshot = this.scope.getSnapshot()
+  this.scope.mutate(ops, snapshot.revision).catch(function () {
+    self.loopOverride = null
+    self.publish({ loop: self.loopEnabled(), loopNote: 'save-failed' })
+    self.syncLoop()
+  })
+}
+
+/**
+ * Drive the handsfree loop from whatever the two halves are doing.
+ *
+ * The microphone stays closed while a reply is being spoken (it would record
+ * the speakers) and while the agent is thinking; it reopens by itself once the
+ * reply has finished, which is what makes the exchange handsfree.
+ */
+SpeechController.prototype.syncLoop = function () {
+  // Every step below publishes, and every publish notifies the two stores this
+  // loop watches: without this guard the machine re-enters itself forever.
+  if (this.syncing === true) return
+  this.syncing = true
+  try {
+    this.syncLoopOnce()
+  } finally {
+    this.syncing = false
+  }
+}
+
+/** One pass of the handsfree state machine. */
+SpeechController.prototype.syncLoopOnce = function () {
+  var snapshot = this.store.getSnapshot()
+  var on = this.loopEnabled() === true && snapshot.supported === true
+  if (!on) {
+    if (snapshot.loop === true || snapshot.stage !== 'off') {
+      if (this.mic !== undefined) this.mic.release()
+      this.publish({ loop: false, stage: 'off' })
+    }
+    return
+  }
+  if (snapshot.loop !== true) this.publish({ loop: true })
+
+  var micStatus = this.mic === undefined ? 'idle' : this.mic.store.getSnapshot().status
+  var stage = snapshot.stage
+  if (snapshot.status === 'speaking') {
+    if (stage !== 'speaking') this.publish({ stage: 'speaking' })
+    return
+  }
+  if (micStatus === 'starting' || micStatus === 'recording' || micStatus === 'transcribing') {
+    if (stage !== 'listening') this.publish({ stage: 'listening' })
+    return
+  }
+  if (micStatus === 'error') {
+    if (stage !== 'paused') this.publish({ stage: 'paused', loopNote: 'mic-failed' })
+    return
+  }
+  if (micStatus === 'idle' && this.mic !== undefined) {
+    var mic = this.mic.store.getSnapshot()
+    if (mic.silent === true) {
+      // Nothing was said for the whole window. The flag is consumed, so it
+      // pauses this pass and a later click can start listening again.
+      this.publish({ stage: 'paused', loopNote: 'heard-nothing' })
+      this.mic.clearSilence()
+      return
+    }
+  }
+  // A submitted message is waiting for the agent: the microphone stays shut,
+  // or it would record the reply through the speakers.
+  if (stage === 'thinking') return
+  if (stage === 'paused') return
+  // Idle on both sides: the user's turn to talk.
+  this.arm()
+}
+
+/** Open the microphone for the user's turn, unless it is already open. */
+SpeechController.prototype.arm = function () {
+  var snapshot = this.store.getSnapshot()
+  if (snapshot.loop !== true || snapshot.supported !== true) return
+  if (this.arming === true) return
+  if (this.mic === undefined) {
+    this.publish({ stage: 'paused', loopNote: 'no-microphone' })
+    return
+  }
+  if (this.mic.store.getSnapshot().supported !== true) {
+    this.publish({ stage: 'paused', loopNote: 'no-microphone' })
+    return
+  }
+  this.arming = true
+  var opened = false
+  try {
+    opened = this.mic.listen() === true
+  } finally {
+    this.arming = false
+  }
+  if (opened) {
+    this.publish({ stage: 'listening', loopNote: null })
+    reportEvent({ event: 'voice-loop-listening', exchanges: snapshot.exchanges })
+  }
+}
+
+/** Open the announcement stream. EventSource retries a dropped connection itself. */
+SpeechController.prototype.open = function () {
+  if (this.stream !== null || this.store.getSnapshot().supported !== true) return
+  var self = this
+  var stream
+  try {
+    stream = new window.EventSource(EVENTS_ROUTE)
+  } catch (error) {
+    this.fail(error)
+    return
+  }
+  this.stream = stream
+  stream.addEventListener('announce', function (message) { self.receive(message) })
+  stream.onopen = function () {
+    self.publish({ connected: true })
+    reportEvent({ event: 'speech-listening' })
+  }
+  stream.onerror = function () {
+    self.publish({ connected: false })
+    // A dropped connection is retried by the browser itself. A refused stream
+    // is not: per spec a non-200 answer makes EventSource fail the connection
+    // for good. A page that mounted before the host served this route (or in
+    // the seconds around a restart) would otherwise stay mute until someone
+    // reloaded it by hand, so reopen it here.
+    if (stream.readyState !== 2) return
+    self.closeStream()
+    reportEvent({ event: 'speech-stream-closed' })
+    if (self.retry !== null) return
+    self.retry = window.setTimeout(function () {
+      self.retry = null
+      if (self.enabled()) self.open()
+    }, STREAM_RETRY_MS)
+  }
+}
+
+/** Close the announcement stream, if one is open. */
+SpeechController.prototype.closeStream = function () {
+  var stream = this.stream
+  this.stream = null
+  if (stream === null) return
+  try {
+    stream.close()
+  } catch (error) {
+    // Already closed.
+  }
+}
+
+/** One frame from the host: remember it, then speak it if the switch is on. */
+SpeechController.prototype.receive = function (message) {
+  var payload
+  try {
+    payload = JSON.parse(message.data)
+  } catch (error) {
+    return
+  }
+  if (payload === null || typeof payload !== 'object' || payload.type !== 'announce') return
+  var text = typeof payload.text === 'string' ? payload.text.trim() : ''
+  this.publish({ heard: this.store.getSnapshot().heard + 1 })
+  reportEvent({
+    event: 'announce-received',
+    sessionId: payload.sessionId,
+    turn: payload.turn,
+    reason: payload.reason,
+    chars: text.length,
+    enabled: this.speaks(),
+  })
+  if (text.length === 0) {
+    // A turn that ended without words (cancelled, failed, or empty): there is
+    // nothing to say, but the handsfree loop's wait is over.
+    this.syncLoop()
+    return
+  }
+  if (this.speaks() !== true) {
+    this.syncLoop()
+    return
+  }
+  this.publish({ stage: this.loopEnabled() === true ? 'speaking' : this.store.getSnapshot().stage })
+  this.enqueue(text)
+}
+
+/** Queue one announcement for playback, dropping the oldest when full. */
+SpeechController.prototype.enqueue = function (text) {
+  var dropped = 0
+  while (this.queue.length >= MAX_SPEECH_QUEUE) {
+    this.queue.shift()
+    dropped += 1
+  }
+  this.queue.push(text)
+  this.publish({
+    pending: this.queue.length + (this.playing ? 1 : 0),
+    dropped: this.store.getSnapshot().dropped + dropped,
+  })
+  if (this.playing !== true) this.next()
+}
+
+/** Speak the next queued announcement, if any. */
+SpeechController.prototype.next = function () {
+  var text = this.queue.shift()
+  if (text === undefined) {
+    // Draining the queue must not overwrite a failure report: the control has
+    // to keep saying that the last attempt failed until something works.
+    this.publish(this.store.getSnapshot().status === 'error' ? { pending: 0 } : { status: 'idle', pending: 0 })
+    return
+  }
+  this.publish({ status: 'speaking', error: null, lastText: text, pending: this.queue.length })
+  this.speak(text)
+}
+
+/**
+ * Synthesise and play one line.
+ * @param text - what to say.
+ * @param options - optional per-call `{ voice, speed }`, for auditioning one
+ * voice from the card without saving it first.
+ */
+SpeechController.prototype.speak = function (text, options) {
+  var self = this
+  var body = { text: text }
+  if (options !== undefined && typeof options.voice === 'string' && options.voice.length > 0) {
+    body.voice = options.voice
+  }
+  if (options !== undefined && typeof options.speed === 'number') body.speed = options.speed
+  this.playing = true
+  fetch(SPEAK_ROUTE, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(function (response) {
+    if (response.ok) return response.blob()
+    return response.json().then(function (body) {
+      throw new Error(body !== null && typeof body === 'object' && typeof body.error === 'string'
+        ? body.error
+        : 'HTTP ' + response.status)
+    }, function () {
+      throw new Error('HTTP ' + response.status)
+    })
+  }).then(function (blob) {
+    if (blob.size === 0) throw new Error('the host returned no audio')
+    return self.play(blob)
+  }).then(function (bytes) {
+    self.playing = false
+    self.publish({ status: 'idle', error: null, spoken: self.store.getSnapshot().spoken + 1 })
+    reportEvent({ event: 'spoke', bytes: bytes, chars: text.length })
+    self.next()
+    // The reply is over: in loop mode the user's turn starts now.
+    self.syncLoop()
+  }, function (error) {
+    self.playing = false
+    // An interrupted announcement is not a failure: the switch that stopped it
+    // already published the idle state the user is looking at.
+    if (error !== null && typeof error === 'object' && error.name === 'AbortError') {
+      self.next()
+      self.syncLoop()
+      return
+    }
+    self.fail(error)
+    self.next()
+    self.syncLoop()
+  })
+}
+
+/**
+ * Play one audio blob, resolving once it has finished.
+ * @param blob - the synthesised audio.
+ * @returns a promise of the byte count.
+ */
+SpeechController.prototype.play = function (blob) {
+  var self = this
+  return new Promise(function (resolve, reject) {
+    var url = URL.createObjectURL(blob)
+    var audio = new window.Audio(url)
+    var settled = false
+    var abortable = function () {
+      var stopped = new Error('announcement interrupted')
+      stopped.name = 'AbortError'
+      settle(stopped)
+    }
+    var settle = function (error) {
+      if (settled) return
+      settled = true
+      audio.onended = null
+      audio.onerror = null
+      if (self.abort === abortable) self.abort = null
+      if (self.audio === audio) {
+        self.audio = null
+        self.objectURL = null
+      }
+      try {
+        URL.revokeObjectURL(url)
+      } catch (ignored) {
+        // Already revoked.
+      }
+      if (error === null) resolve(blob.size)
+      else reject(error)
+    }
+    self.audio = audio
+    self.objectURL = url
+    self.abort = abortable
+    audio.onended = function () { settle(null) }
+    audio.onerror = function () { settle(new Error('playback failed')) }
+    var started
+    try {
+      started = audio.play()
+    } catch (error) {
+      settle(error)
+      return
+    }
+    if (started !== undefined && typeof started.then === 'function') {
+      started.then(function () {}, function (error) { settle(error) })
+    }
+  })
+}
+
+/** Stop playback and drop everything queued behind it. */
+SpeechController.prototype.stop = function () {
+  this.queue = []
+  var audio = this.audio
+  if (audio !== null) {
+    try {
+      audio.pause()
+    } catch (error) {
+      // A paused element is already silent.
+    }
+  }
+  var abort = this.abort
+  this.abort = null
+  if (abort !== null) abort()
+  this.publish({ status: 'idle', pending: 0 })
+}
+
+/** Flip the switch. Writable deployments persist it; others keep it in-page. */
+SpeechController.prototype.toggle = function () {
+  var self = this
+  if (this.store.getSnapshot().supported !== true) return
+  var next = this.enabled() !== true
+  this.override = next
+  this.publish({ enabled: next, error: null })
+  if (next) this.open()
+  else this.stop()
+  if (this.scope === undefined) return
+  var snapshot = this.scope.getSnapshot()
+  if (snapshot.writable !== true || snapshot.mode !== 'host') return
+  this.scope.mutate([{ op: 'set', path: ['speakEnabled'], value: next }], snapshot.revision)
+    .catch(function (error) {
+      self.override = null
+      self.publish({ enabled: self.enabled(), error: 'could not save the switch' })
+      if (self.enabled() !== true) self.stop()
+    })
+}
+
+/** Speak one line now, for the card's test button. Appends to the queue. */
+SpeechController.prototype.tryVoice = function (text, options) {
+  if (this.store.getSnapshot().supported !== true) return
+  if (typeof text !== 'string' || text.trim().length === 0) return
+  var line = text.trim()
+  if (options !== undefined && (typeof options.voice === 'string' || typeof options.speed === 'number')) {
+    // An auditioned line must not be confused with an announcement: it carries
+    // its own voice through to the endpoint.
+    if (this.playing === true) this.queue.push(line)
+    else {
+      this.publish({ status: 'speaking', error: null, lastText: line, pending: this.queue.length })
+      this.playing = true
+      this.speak(line, options)
+    }
+    return
+  }
+  this.enqueue(line)
+}
+
+/** Publish a failure without dropping the switch. */
+SpeechController.prototype.fail = function (error) {
+  var message = error !== null && typeof error === 'object' && typeof error.message === 'string'
+    ? error.message
+    : String(error)
+  var blocked = error !== null && typeof error === 'object' && error.name === 'NotAllowedError'
+  this.publish({ status: 'error', error: blocked ? 'blocked' : message })
+  reportEvent({ event: 'speech-failed', error: message, blocked: blocked })
+}
+
+/** Close the stream and stop the audio. */
+SpeechController.prototype.dispose = function () {
+  if (this.offScope !== undefined) {
+    this.offScope()
+    this.offScope = undefined
+  }
+  if (this.offMic !== undefined) {
+    this.offMic()
+    this.offMic = undefined
+  }
+  if (this.retry !== null) {
+    window.clearTimeout(this.retry)
+    this.retry = null
+  }
+  this.input = null
+  this.closeStream()
+  this.stop()
+  this.audio = null
+  this.objectURL = null
+  this.abort = null
+}
+
+SpeechController.prototype.inject = function () {
+  var self = this
+  return {
+    hooks: { speech: this.store },
+    toggleSpeech: function () { self.toggle() },
+    say: function (text, options) { self.tryVoice(text, options) },
+  }
+}
+
+/** The handsfree loop's inject face: adds the switch and the session handover. */
+SpeechController.prototype.loopInject = function () {
+  var self = this
+  return {
+    hooks: { speech: this.store, mic: this.mic === undefined ? undefined : this.mic.store },
+    toggleLoop: function () { self.toggleLoop() },
+    attachInput: function (actions) { self.attachInput(actions) },
   }
 }
 
@@ -907,6 +2244,9 @@ function micStyle(state) {
 function MicButton(props) {
   var t = props.t
   var state = props.useMic(function (value) { return value })
+  var loop = props.useSpeech === undefined
+    ? undefined
+    : props.useSpeech(function (value) { return value === undefined || value === null ? undefined : value.loop })
   var draft = props.useInput === undefined
     ? ''
     : props.useInput(function (input) { return input === undefined || input === null ? '' : input.draft })
@@ -923,10 +2263,13 @@ function MicButton(props) {
   React.useEffect(function () {
     if (state.textSeq === 0 || state.textSeq === lastSeq.current) return
     lastSeq.current = state.textSeq
+    // In handsfree mode the speech controller submits the transcript itself;
+    // pasting it here as well would double it.
+    if (loop === true) return
     if (actions === undefined || typeof actions.setDraft !== 'function') return
     var merged = mergeDraft(draft, state.text)
     if (merged !== draft) actions.setDraft(merged)
-  }, [state.textSeq, state.text, draft, actions])
+  }, [state.textSeq, state.text, draft, actions, loop])
 
   var supported = state.supported === true
   var recording = state.status === 'recording'
@@ -973,6 +2316,296 @@ function MicButton(props) {
   )
 }
 
+/**
+ * Speaker glyph, in the same 16x16 house style as the microphone. The `on`
+ * form carries two sound arcs; the `off` form a slash, so the switch reads at
+ * a glance without a text label.
+ * @param on - whether announcements are spoken.
+ * @param size - square edge in px.
+ * @returns the icon element.
+ */
+function SpeakerGlyph(on, size) {
+  return React.createElement('svg', {
+    width: size,
+    height: size,
+    viewBox: '0 0 16 16',
+    fill: 'none',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  },
+    // Cone and box.
+    React.createElement('path', {
+      fill: 'currentColor',
+      d: 'M3.1 6.2h1.9L8.2 3.4c.5-.4 1.2-.1 1.2.5v8.2c0 .6-.7.9-1.2.5L5 9.8H3.1c-.4 0-.7-.3-.7-.7V6.9c0-.4.3-.7.7-.7z',
+    }),
+    on
+      ? React.createElement('path', {
+        stroke: 'currentColor',
+        strokeWidth: 1.3,
+        strokeLinecap: 'round',
+        fill: 'none',
+        d: 'M11.3 6.1c.9 1.1.9 2.7 0 3.8M13.1 4.3c1.8 2.1 1.8 5.3 0 7.4',
+      })
+      : React.createElement('path', {
+        stroke: 'currentColor',
+        strokeWidth: 1.4,
+        strokeLinecap: 'round',
+        fill: 'none',
+        d: 'M11.1 5.3l4 5.4M15.1 5.3l-4 5.4',
+      }),
+  )
+}
+
+/**
+ * The announcement control's box: quiet while announcements are off, tinted
+ * while one is playing.
+ * @param state - enabled / speaking / failed / hovered / supported.
+ * @returns the button style.
+ */
+function speakerStyle(state) {
+  var failed = state.failed === true
+  var muted = state.enabled !== true
+  return {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '5px',
+    minWidth: '32px',
+    minHeight: '32px',
+    padding: '0 6px',
+    border: `1px solid ${failed ? '#e5484d' : 'var(--dsw-color-border, #d0d5dd)'}`,
+    background: failed
+      ? 'rgba(229, 72, 77, 0.10)'
+      : state.speaking === true
+        ? 'rgba(64, 132, 214, 0.16)'
+        : state.hovered === true ? 'var(--dsw-color-surface-hover, rgba(127, 127, 127, 0.12))' : 'transparent',
+    color: failed ? '#e5484d' : 'inherit',
+    borderRadius: '8px',
+    fontSize: '12px',
+    lineHeight: 1,
+    opacity: muted && state.supported === true ? 0.55 : 1,
+    cursor: state.supported === true ? 'pointer' : 'default',
+  }
+}
+
+/**
+ * Composer control for spoken announcements: click to switch the host's
+ * announcements on or off. Turning them off silences whatever is playing, which
+ * is also the manual way to interrupt one.
+ * @param props - composed slot props.
+ * @returns the control element.
+ */
+function SpeakerButton(props) {
+  var t = props.t
+  var state = props.useSpeech(function (value) { return value })
+  var reported = React.useRef(false)
+
+  React.useEffect(function () {
+    if (reported.current) return
+    reported.current = true
+    reportEvent({
+      event: 'speech-rendered',
+      slot: 'conversation.input.left',
+      supported: state.supported === true,
+      enabled: state.enabled === true,
+    })
+  }, [])
+
+  var supported = state.supported === true
+  var on = state.enabled === true
+  var speaking = state.status === 'speaking'
+  var failed = state.status === 'error'
+  var label = !supported
+    ? t('speakUnsupported')
+    : failed
+      ? `${t('speakError')}: ${state.error === 'blocked' ? t('speakBlocked') : state.error}`
+      : on
+        ? `${t('speakToggleOff')} · ${t(speaking ? 'speakSaying' : 'speakListening')}`
+        : t('speakToggleOn')
+
+  var hoverPair = React.useState(false)
+  var hovered = hoverPair[0]
+  var setHovered = hoverPair[1]
+
+  return React.createElement('button', {
+    type: 'button',
+    title: label,
+    'aria-label': label,
+    'aria-pressed': on,
+    disabled: !supported,
+    style: speakerStyle({ enabled: on, speaking: speaking, failed: failed, hovered: hovered, supported: supported }),
+    onMouseEnter: function () { setHovered(true) },
+    onMouseLeave: function () { setHovered(false) },
+    onFocus: function () { setHovered(true) },
+    onBlur: function () { setHovered(false) },
+    onClick: function () { props.toggleSpeech() },
+  },
+    SpeakerGlyph(on, 18),
+    speaking === true && state.pending > 1
+      ? React.createElement('span', { style: { fontVariantNumeric: 'tabular-nums' } }, String(state.pending))
+      : null,
+  )
+}
+
+/**
+ * Speech-bubble glyph for the handsfree control: a bubble with sound bars, or
+ * the same bubble struck through when the loop is off.
+ * @param on - whether the conversation loop is running.
+ * @param size - square edge in px.
+ * @returns the icon element.
+ */
+function VoiceGlyph(on, size) {
+  var bars = on
+    ? [React.createElement('rect', { key: 'a', x: 5.1, y: 6.6, width: 1.3, height: 3.2, rx: 0.65, fill: 'currentColor' }),
+      React.createElement('rect', { key: 'b', x: 7.4, y: 5.2, width: 1.3, height: 6, rx: 0.65, fill: 'currentColor' }),
+      React.createElement('rect', { key: 'c', x: 9.7, y: 6.6, width: 1.3, height: 3.2, rx: 0.65, fill: 'currentColor' })]
+    : [React.createElement('path', {
+      key: 'slash',
+      stroke: 'currentColor',
+      strokeWidth: 1.4,
+      strokeLinecap: 'round',
+      fill: 'none',
+      d: 'M3.4 3.4l9.2 9.2',
+    })]
+  return React.createElement('svg', {
+    width: size,
+    height: size,
+    viewBox: '0 0 16 16',
+    fill: 'none',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  },
+    React.createElement('path', {
+      stroke: 'currentColor',
+      strokeWidth: 1.3,
+      strokeLinejoin: 'round',
+      fill: 'none',
+      // A rounded bubble with a tail: the house style is outline-only icons.
+      d: 'M2.4 4.6c0-.9.7-1.6 1.6-1.6h8c.9 0 1.6.7 1.6 1.6v5c0 .9-.7 1.6-1.6 1.6H7.1L4 13.4v-2.2h-.1c-.8 0-1.5-.7-1.5-1.6z',
+    }),
+    bars,
+  )
+}
+
+/**
+ * The handsfree control's box: quiet when off, tinted while the loop is
+ * listening, and accent-tinted while a reply is being spoken.
+ * @param state - loop / stage / failed / hovered / supported.
+ * @returns the button style.
+ */
+function voiceStyle(state) {
+  var failed = state.failed === true
+  var on = state.loop === true
+  var listening = state.stage === 'listening'
+  var thinking = state.stage === 'thinking'
+  return {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '5px',
+    minWidth: '32px',
+    minHeight: '32px',
+    padding: '0 6px',
+    border: `1px solid ${failed ? '#e5484d' : on ? '#e5484d' : 'var(--dsw-color-border, #d0d5dd)'}`,
+    background: failed
+      ? 'rgba(229, 72, 77, 0.10)'
+      : listening
+        ? 'rgba(229, 72, 77, 0.12)'
+        : thinking
+          ? 'rgba(64, 132, 214, 0.16)'
+          : on
+            ? 'rgba(64, 132, 214, 0.10)'
+            : state.hovered === true ? 'var(--dsw-color-surface-hover, rgba(127, 127, 127, 0.12))' : 'transparent',
+    color: failed || listening ? '#e5484d' : 'inherit',
+    borderRadius: '8px',
+    fontSize: '12px',
+    lineHeight: 1,
+    cursor: state.supported === true ? 'pointer' : 'default',
+    opacity: state.supported === true ? 1 : 0.5,
+  }
+}
+
+/**
+ * The handsfree conversation control: one click starts the exchange, one click
+ * ends it. While it runs it also hands this session's composer to the speech
+ * controller, which is what lets a spoken transcript be submitted without the
+ * user touching the keyboard.
+ * @param props - composed slot props.
+ * @returns the control element.
+ */
+function VoiceButton(props) {
+  var t = props.t
+  var state = props.useSpeech(function (value) { return value })
+  var inputActions = props.inputActions
+  var sessionId = props.session !== undefined && props.session !== null ? props.session.sessionId : undefined
+  var reported = React.useRef(false)
+
+  React.useEffect(function () {
+    if (reported.current) return
+    reported.current = true
+    reportEvent({
+      event: 'voice-control-rendered',
+      slot: 'conversation.input.left',
+      supported: state.supported === true,
+      sessionId: sessionId,
+    })
+  }, [])
+
+  // The session handover. A stable action face means this runs once per session.
+  React.useEffect(function () {
+    if (typeof props.attachInput !== 'function') return undefined
+    if (inputActions === undefined) {
+      props.attachInput(null)
+      return undefined
+    }
+    props.attachInput({
+      setDraft: function (text) { inputActions.setDraft(text) },
+      submit: function () { inputActions.submit() },
+      sessionId: sessionId,
+    })
+    return function () { props.attachInput(null) }
+  }, [inputActions, sessionId])
+
+  var loop = state.loop === true
+  var stage = state.stage === undefined ? 'off' : state.stage
+  var label = state.supported !== true
+    ? t('speakUnsupported')
+    : !loop
+      ? t('voiceStart')
+      : stage === 'listening'
+        ? `${t('voiceStop')} · ${t('voiceListening')}`
+        : stage === 'thinking'
+          ? `${t('voiceStop')} · ${t('voiceThinking')}`
+          : stage === 'speaking'
+            ? `${t('voiceStop')} · ${t('voiceSpeaking')}`
+            : `${t('voiceStart')} · ${t(state.loopNote === 'heard-nothing' ? 'voiceHeardNothing' : 'voicePaused')}`
+
+  var hoverPair = React.useState(false)
+  var hovered = hoverPair[0]
+  var setHovered = hoverPair[1]
+
+  return React.createElement('button', {
+    type: 'button',
+    title: label,
+    'aria-label': label,
+    'aria-pressed': loop,
+    disabled: state.supported !== true,
+    style: voiceStyle({
+      loop: loop, stage: stage, failed: state.status === 'error', hovered: hovered, supported: state.supported === true,
+    }),
+    onMouseEnter: function () { setHovered(true) },
+    onMouseLeave: function () { setHovered(false) },
+    onFocus: function () { setHovered(true) },
+    onBlur: function () { setHovered(false) },
+    onClick: function () { props.toggleLoop() },
+  },
+    VoiceGlyph(loop, 18),
+    state.exchanges > 0
+      ? React.createElement('span', { style: { fontVariantNumeric: 'tabular-nums' } }, String(state.exchanges))
+      : null,
+  )
+}
+
 /** Required services (cordis fiber inject). */
 var inject = ['slots', 'locale', 'remote.credentials', 'settingsScope']
 
@@ -984,7 +2617,16 @@ function apply(ctx) {
   ctx.effect(function () { return ctx.locale.register(NS, DICTIONARIES) }, 'dsh-minimax-asr: dictionaries')
   reportEvent({ event: 'applied', half: 'client' })
 
-  var controller = new CardController(ctx)
+  // The microphone is built first: the speech controller drives it in handsfree
+  // loop mode, and the card shows both their states.
+  var mic = new MicController(ctx)
+  ctx.effect(function () { return function () { mic.dispose() } }, 'dsh-minimax-asr: microphone controller')
+
+  // Spoken announcements: the host pushes finished turns, this half plays them.
+  var speech = new SpeechController(ctx, mic)
+  ctx.effect(function () { return function () { speech.dispose() } }, 'dsh-minimax-asr: speech controller')
+
+  var controller = new CardController(ctx, speech)
   ctx.effect(function () { return function () { controller.dispose() } }, 'dsh-minimax-asr: card controller')
 
   // The slot is declared at runtime by the configurable tab of
@@ -1003,8 +2645,6 @@ function apply(ctx) {
   // Voice input: a compact control in the composer tool row. The slot is
   // session-scoped, so the component also receives `useInput`/`inputActions`
   // and can write the transcript into that session's draft.
-  var mic = new MicController(ctx)
-  ctx.effect(function () { return function () { mic.dispose() } }, 'dsh-minimax-asr: microphone controller')
   ctx.slots.inject('conversation.input.left', function () {
     reportEvent({ event: 'mic-registered', slot: 'conversation.input.left' })
     return ctx.slots.register({
@@ -1012,8 +2652,33 @@ function apply(ctx) {
       id: 'minimax-asr-mic',
       order: 50,
       locale: NS,
-      inject: function () { return mic.inject() },
+      inject: function () { return mic.inject(speech) },
     }, MicButton)
+  })
+
+  // The announcement switch sits next to the microphone, at the end of the row.
+  ctx.slots.inject('conversation.input.left', function () {
+    reportEvent({ event: 'speaker-registered', slot: 'conversation.input.left' })
+    return ctx.slots.register({
+      name: 'conversation.input.left',
+      id: 'minimax-asr-speaker',
+      order: 51,
+      locale: NS,
+      inject: function () { return speech.inject() },
+    }, SpeakerButton)
+  })
+
+  // The handsfree conversation switch, last in the row. It is the entry that
+  // hands the session's composer over to the loop.
+  ctx.slots.inject('conversation.input.left', function () {
+    reportEvent({ event: 'voice-registered', slot: 'conversation.input.left' })
+    return ctx.slots.register({
+      name: 'conversation.input.left',
+      id: 'minimax-asr-voice',
+      order: 52,
+      locale: NS,
+      inject: function () { return speech.loopInject() },
+    }, VoiceButton)
   })
 }
 
