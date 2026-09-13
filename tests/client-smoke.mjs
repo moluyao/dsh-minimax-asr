@@ -353,9 +353,12 @@ const sandbox = {
   },
   Blob,
   // A controllable clock and interval registry, so the auto-stop can be driven
-  // without waiting for real seconds to pass.
+  // without waiting for real seconds to pass. `clearInterval` really clears:
+  // a leaked VAD timer would keep mutating the next window's counters.
   setInterval: (callback) => { intervals.push(callback); return intervals.length },
-  clearInterval: () => {},
+  clearInterval: (id) => {
+    if (typeof id === 'number' && id >= 1 && id <= intervals.length) intervals[id - 1] = null
+  },
   Date: { now: () => clock.now },
   console,
 }
@@ -364,7 +367,7 @@ const intervals = []
 /** Advance the fake clock and run every scheduled tick once. */
 function advance(seconds) {
   clock.now += seconds * 1000
-  for (const tick of [...intervals]) tick()
+  for (const tick of [...intervals]) if (tick !== null) tick()
 }
 vm.createContext(sandbox)
 vm.runInContext(source, sandbox, { filename: 'client.js' })
@@ -978,7 +981,7 @@ check(speechStore.getSnapshot().spoken === spokenBeforeReopen + 1, 'an announcem
 function vadFrames(count, ms = 100) {
   for (let i = 0; i < count; i += 1) {
     clock.now += ms
-    for (const timer of [...intervals]) timer()
+    for (const timer of [...intervals]) if (timer !== null) timer()
   }
 }
 
@@ -1050,7 +1053,39 @@ check(micStore.getSnapshot().status === 'idle', 'the microphone was released')
 check(media.calls.length === uploadsBeforeLoop, `silence was never uploaded (${media.calls.length - uploadsBeforeLoop})`)
 check(diagnostics.some(entry => entry.event === 'mic-level'), 'the measured microphone level was reported to the host')
 const levelReport = diagnostics.filter(entry => entry.event === 'mic-level').pop()
-check(typeof levelReport.gate === 'number' && levelReport.gate >= 0.0025, `the gate has an absolute floor (${levelReport.gate})`)
+check(typeof levelReport.gate === 'number' && levelReport.gate >= 0.008, `the gate has an absolute floor (${levelReport.gate})`)
+
+// 1b. Room noise is not speech. A level that clears the gate but never reaches
+// the speech bar must not be uploaded: near-silence reaches the recogniser as an
+// invented sentence ("他出生于伦敦。" arrived this way, twelve times), and the
+// loop would post that invention as the user's own words.
+voiceFace.toggleLoop()
+voiceFace.toggleLoop()
+await tick(4)
+const uploadsBeforeNoise = media.calls.length
+media.level = 0.012
+vadFrames(305)
+await tick(8)
+check(speechStore.getSnapshot().stage === 'paused', `noise pauses the loop instead of submitting (${speechStore.getSnapshot().stage})`)
+check(media.calls.length === uploadsBeforeNoise, `noise was never uploaded (${media.calls.length - uploadsBeforeNoise})`)
+const noiseReport = diagnostics.filter(entry => entry.event === 'mic-level').pop()
+check(noiseReport.speechFrames === 0, `noise produced no speech frames (${noiseReport.speechFrames})`)
+
+// 1c. A blip long enough to be heard but too short to be a sentence is dropped
+// the same way — a keyboard tap must not become a message.
+voiceFace.toggleLoop()
+voiceFace.toggleLoop()
+await tick(4)
+const uploadsBeforeBlip = media.calls.length
+const submitsBeforeBlip = submissions.filter(entry => entry.kind === 'submit').length
+media.level = 0.05
+vadFrames(4)
+media.level = 0
+vadFrames(16)
+await tick(6)
+check(media.calls.length === uploadsBeforeBlip, `a 400 ms blip was never uploaded (${media.calls.length - uploadsBeforeBlip})`)
+check(submissions.filter(entry => entry.kind === 'submit').length === submitsBeforeBlip,
+  'nothing was sent for a 400 ms blip')
 
 // 2. Speech, then silence: the turn ends by itself and is submitted.
 voiceFace.toggleLoop()
@@ -1062,7 +1097,7 @@ check(micStore.getSnapshot().status === 'recording', 'the loop reopens the micro
 
 const uploadsBeforeTurn = media.calls.length
 media.level = 0.05
-vadFrames(4)
+vadFrames(9)
 check(micStore.getSnapshot().heard === true, 'the gate hears speech')
 media.level = 0
 vadFrames(14)

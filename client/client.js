@@ -48,21 +48,31 @@ var STREAM_RETRY_MS = 4000
 var VOICES_ROUTE = '/minimax-asr/voices'
 
 // --- handsfree listening ----------------------------------------------------
-// The level gate has to survive a quiet built-in microphone array, so it is
-// adaptive: a floor measured from the room, plus a low absolute minimum.
+// A frame has to clear the room's own noise floor AND look like speech, for long
+// enough to be a sentence. The second half of that rule is what stops a keyboard
+// tap or a chair creak from being transcribed — and an invented transcript from
+// being sent as if the user had said it.
 
 /** One analysis frame; the gate is evaluated per frame. */
 var VAD_FRAME_MS = 100
 /** Absolute level floor, below which nothing counts as speech. */
-var VAD_MIN_RMS = 0.0025
+var VAD_MIN_RMS = 0.008
+/** A frame this loud is speech, not merely "above the room". */
+var VAD_SPEECH_RMS = 0.03
+/** Consecutive speech frames before the turn is treated as speech. */
+var VAD_SPEECH_FRAMES = 3
+/**
+ * Speech frames a window needs before it is worth transcribing (600 ms). Room
+ * noise reaches the recogniser as near-silence, and near-silence comes back as
+ * an invented sentence.
+ */
+var VAD_MIN_SPEECH_FRAMES = 6
 /** A frame counts as speech above this multiple of the measured noise floor. */
 var VAD_FLOOR_FACTOR = 3
 /** Ceiling on the gate, so a loud room cannot deafen the loop entirely. */
 var VAD_MAX_GATE = 0.03
 /** Ignore this much audio at the start, while the meter settles. */
 var VAD_SETTLE_MS = 300
-/** Consecutive loud frames before the turn is treated as speech. */
-var VAD_SPEECH_FRAMES = 2
 /** Silence after speech that ends the turn. */
 var VAD_SILENCE_MS = 1200
 /** Give up and release the microphone when nothing is said for this long. */
@@ -1030,7 +1040,8 @@ function createLevelMeter(stream) {
 }
 
 /** Append a transcript to the draft the user already typed. */
-function mergeDraft(draft, addition) {  var current = typeof draft === 'string' ? draft : ''
+function mergeDraft(draft, addition) {
+  var current = typeof draft === 'string' ? draft : ''
   var text = typeof addition === 'string' ? addition.trim() : ''
   if (text.length === 0) return current
   if (current.trim().length === 0) return text
@@ -1079,6 +1090,8 @@ function MicController(ctx) {
   this.requestSeq = 0
   this.floor = null
   this.heardFrames = 0
+  /** Frames in this window that were loud enough to be a voice. */
+  this.speechFrames = 0
   this.quietSince = 0
   this.loudest = 0
   this.lastReport = 0
@@ -1139,6 +1152,7 @@ MicController.prototype.listen = function (options) {
   this.abandoned = false
   this.floor = null
   this.heardFrames = 0
+  this.speechFrames = 0
   this.quietSince = 0
   this.loudest = 0
   this.publish({ handsfree: true, heard: false, level: 0, gate: 0, silent: false })
@@ -1198,11 +1212,14 @@ MicController.prototype.clearSilence = function () {
 /**
  * Start the gate that decides when a handsfree turn has ended.
  *
- * A quiet built-in microphone array reports levels far below what a naive
- * threshold expects, so the gate adapts: the first frames measure the room, and
- * speech has to clear both that floor and a low absolute minimum. The measured
- * numbers go to the host's diagnostics route, so a mis-tuned gate can be seen
- * from outside the browser.
+ * The gate has to survive a quiet built-in microphone array, so it adapts: the
+ * room is measured first, and speech has to clear both that floor and an
+ * absolute minimum. Above the gate, a window is only treated as speech when it
+ * contains {@link VAD_MIN_SPEECH_FRAMES} frames that are actually loud — room
+ * noise that merely crosses the gate must never reach the recogniser, because
+ * near-silence comes back as an invented sentence. The measured numbers go to
+ * the host's diagnostics route, so a mis-tuned gate is visible from outside the
+ * browser.
  */
 MicController.prototype.startMeter = function () {
   var self = this
@@ -1216,23 +1233,29 @@ MicController.prototype.startMeter = function () {
     var level = self.meter === null ? 0 : self.meter.level()
     var now = Date.now()
     var elapsed = now - self.startedAt
-    // The floor is only ever learned from frames that are *not* speech, so a
-    // turn that begins loudly cannot raise the gate above the speaker's own
-    // voice (which would make the loop deaf for the rest of the window).
+    // The floor is only ever learned from quiet frames, so a turn that begins
+    // loudly cannot raise the gate above the speaker's own voice (which would
+    // make the loop deaf for the rest of the window).
     var reference = self.floor === null ? VAD_MIN_RMS : self.floor
     var gate = Math.min(VAD_MAX_GATE, Math.max(VAD_MIN_RMS, reference * VAD_FLOOR_FACTOR))
     if (elapsed >= VAD_SETTLE_MS) {
-      if (level > gate) {
+      if (level >= VAD_SPEECH_RMS) {
+        // Loud enough to be a voice: the only thing that counts as speech.
+        self.speechFrames += 1
         self.heardFrames += 1
         self.quietSince = 0
         if (level > self.loudest) self.loudest = level
       } else {
-        self.floor = self.floor === null ? level : Math.min(self.floor, level)
-        if (self.heardFrames > 0 && self.quietSince === 0) self.quietSince = now
-        self.heardFrames = 0
+        if (level <= gate) {
+          self.floor = self.floor === null ? level : Math.min(self.floor, level)
+          self.heardFrames = 0
+        }
+        // A pause inside a sentence: the turn ends after VAD_SILENCE_MS of it,
+        // but the speech frames already counted still stand.
+        if (self.speechFrames >= VAD_SPEECH_FRAMES && self.quietSince === 0) self.quietSince = now
       }
     }
-    var spoken = self.store.getSnapshot().heard === true || self.loudest > gate
+    var spoken = self.speechFrames >= VAD_SPEECH_FRAMES
     self.publish({
       level: Number(level.toFixed(5)),
       gate: Number(gate.toFixed(5)),
@@ -1247,45 +1270,69 @@ MicController.prototype.startMeter = function () {
         floor: self.floor === null ? null : Number(self.floor.toFixed(5)),
         gate: Number(gate.toFixed(5)),
         loudest: Number(self.loudest.toFixed(5)),
+        speechFrames: self.speechFrames,
         heard: spoken,
         seconds: Math.floor(elapsed / 1000),
       })
     }
     if (spoken && self.quietSince !== 0 && now - self.quietSince >= VAD_SILENCE_MS) {
+      if (self.speechFrames < VAD_MIN_SPEECH_FRAMES) {
+        // A blip, not a sentence. Sending this would have the recogniser invent
+        // one, and the loop would post the invention as the user's words.
+        reportEvent({ event: 'mic-too-short', speechFrames: self.speechFrames })
+        self.abandonHandsfree(true)
+        return
+      }
       // Said something, then stopped: that is the end of the turn.
       self.stop()
       return
     }
     if (spoken && elapsed >= VAD_MAX_TURN_MS) {
+      if (self.speechFrames < VAD_MIN_SPEECH_FRAMES) {
+        self.abandonHandsfree(true)
+        return
+      }
       self.stop()
       return
     }
     if (!spoken && elapsed >= VAD_IDLE_MS) {
       // Nothing was said; release the microphone rather than upload silence.
       reportEvent({ event: 'mic-idle-timeout', seconds: Math.round(elapsed / 1000) })
-      self.vad = false
-      self.handsfree = false
-      self.abandoned = true
-      self.stopMeter()
-      if (self.timer !== null) {
-        clearInterval(self.timer)
-        self.timer = null
-      }
-      var idleRecorder = self.recorder
-      self.recorder = null
-      self.chunks = []
-      if (idleRecorder !== null && idleRecorder.state !== 'inactive') {
-        try {
-          idleRecorder.onstop = null
-          idleRecorder.stop()
-        } catch (error) {
-          // Already stopped.
-        }
-      }
-      self.releaseStream()
-      self.publish({ status: 'idle', seconds: 0, handsfree: false, heard: false, silent: true })
+      self.abandonHandsfree(true)
+      return
     }
   }, VAD_FRAME_MS)
+}
+
+/**
+ * End a handsfree window without uploading it: the microphone is released and
+ * `silent` tells the loop it heard nothing, so it pauses instead of retrying
+ * forever. Nothing here may reach the transcription endpoint — a window with no
+ * real speech in it comes back from the recogniser as an invented sentence.
+ * @param silent - whether to mark the window as "nothing was said".
+ */
+MicController.prototype.abandonHandsfree = function (silent) {
+  this.vad = false
+  this.handsfree = false
+  this.abandoned = true
+  this.stopMeter()
+  if (this.timer !== null) {
+    clearInterval(this.timer)
+    this.timer = null
+  }
+  var recorder = this.recorder
+  this.recorder = null
+  this.chunks = []
+  if (recorder !== null && recorder.state !== 'inactive') {
+    try {
+      recorder.onstop = null
+      recorder.stop()
+    } catch (error) {
+      // Already stopped.
+    }
+  }
+  this.releaseStream()
+  this.publish({ status: 'idle', seconds: 0, handsfree: false, heard: false, silent: silent === true })
 }
 
 /** Open the microphone and begin recording. */
