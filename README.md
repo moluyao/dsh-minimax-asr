@@ -4,7 +4,8 @@
 一个给模型用的 `transcribe_audio` 工具、一张设置卡片、输入框里的语音输入按钮，
 以及**任务结束后自动把结果念给你听**的喇叭。
 
-<img width="1752" height="956" alt="34256464645645" src="https://github.com/user-attachments/assets/8dfdb0ba-7788-468c-b7bd-53e70c659c50" />
+<img width="1900" height="899" alt="20260914054918" src="https://github.com/user-attachments/assets/b2db5426-f417-4a48-9e13-e4f4c196f4a2" />
+
 
 
 中文 | [English](README.en.md) | [更新日志](CHANGELOG.md) | **v0.2.0**
