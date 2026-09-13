@@ -1,6 +1,6 @@
 {
   "name": "dsh-minimax-asr",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "MiniMax speech-to-text (asr-1.0) and text-to-speech (speech-2.8-hd) as a global DeepSeek Harness plugin: a transcribe_audio tool, an announce_speech tool, a settings card, composer voice input, spoken turn announcements, and handsfree conversation.",
   "keywords": [
     "dsh",
@@ -40,6 +40,8 @@
     "node": ">=20"
   },
   "scripts": {
+    "prepack": "npm run check:bom",
+    "check:bom": "node tests/no-bom.mjs",
     "test": "node tests/client-smoke.mjs",
     "test:installed": "node tests/installed-check.mjs",
     "test:tool": "node tests/smoke.mjs",
@@ -74,3 +76,4 @@
     }
   }
 }
+

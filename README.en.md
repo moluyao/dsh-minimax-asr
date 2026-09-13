@@ -218,6 +218,7 @@ MINIMAX_API_KEY=... node tests/smoke.mjs <audio-file> [response_format] [timesta
 MINIMAX_API_KEY=... node tests/route-smoke.mjs <audio-file>
 node tests/client-smoke.mjs
 node tests/installed-check.mjs <profile-dir>
+node tests/no-bom.mjs
 ```
 
 `tests/smoke.mjs` loads `lib/index.js`, runs `apply` against a stub context, and
@@ -300,3 +301,7 @@ inject, the host half's export shape) plus the single-activation-site invariant.
 ## License
 
 MIT
+- `tests/no-bom.mjs` scans the whole tree for a UTF-8 BOM. `JSON.parse` does
+  not strip U+FEFF, so a BOM in `package.json` or the bundle patch **aborts
+  profile composition and the port never binds** — and this plugin is installed
+  into the profile as a `link:`, so this working tree is what the host reads.

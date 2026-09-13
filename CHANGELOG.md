@@ -4,6 +4,60 @@ All notable changes to this plugin. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — an always-on loop, and a pause you own
+
+Reported from real use: after a reply the loop stopped listening after a while
+and only a toggle brought it back, and the pause before sending was so short
+that a sentence went out half-finished.
+
+### Fixed
+
+- **The loop went deaf after the first window, silently.** Every handsfree
+  window built its own `AudioContext`, and Chrome starts a context created
+  outside a user gesture *suspended* — an analyser on it reports zero for every
+  frame. The first window worked because a click had just happened; every window
+  opened afterwards by the timer was deaf: the microphone looked open, the level
+  never moved, nothing was transcribed, and the only way back was another click.
+  The microphone controller now creates **one** context and reuses it, resuming
+  it when suspended, and reports its state to the diagnostics route so a context
+  that never started is visible from outside the browser.
+- **A paused loop now retries by itself.** While the switch is on and the loop is
+  not listening, it tries again every five seconds, dropping whatever the
+  previous attempt failed with and opening the microphone again — including after
+  a microphone error. A handsfree mode that needs a click to come back is not
+  handsfree.
+
+### Added
+
+- `voiceSilenceSeconds` (default **5**, range 1–60): how long a pause means the
+  sentence is finished. The old fixed 1.2 s sent messages while the user was
+  still working out what to say; 3–15 seconds is the useful range in practice.
+- `voiceMaxTurnSeconds` (default **300**, range 10–600): the longest single
+  spoken turn before it is sent anyway, for a window that never goes quiet. It
+  was a fixed 60 s, which cut a slow speaker off mid-sentence.
+
+Both are on the settings card, and both take effect on the next window.
+
+### Changed
+
+- The shipped `speakMaxChars` is 80, as the schema has said since 0.2.0; the
+  bundle patch still carried the old 220, which overrode it.
+- The diagnostics ring holds 300 browser reports instead of 50. The microphone
+  level is reported once a second while listening, so the old size pushed every
+  wiring event out within a minute — exactly when a live session is being
+  diagnosed.
+
+### Found in review
+
+- **A full window that contained speech was discarded.** The recording cap rolled
+  every handsfree window over. That is right for a window holding nothing but
+  room noise, and wrong for one holding a long answer, which was thrown away
+  instead of sent. A capped window now sends when it holds real speech and only
+  rolls over when it does not.
+- **A refused microphone would have retried every five seconds, forever.** The
+  self-healing retry backs off now — 5 s doubling to a 60 s ceiling, never
+  giving up.
+
 ## [0.2.1] — handsfree that survives a pause, and noise that stays noise
 
 Two defects from real use, both in the handsfree loop.
@@ -124,6 +178,8 @@ Three defects that the new tests caught, all of them reachable in a real browser
 - `tests/smoke.mjs` and `tests/client-smoke.mjs`, and the single-activation-site
   invariant in `tests/installed-check.mjs`.
 
+[0.2.2]: https://github.com/moluyao/dsh-minimax-asr/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/moluyao/dsh-minimax-asr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/moluyao/dsh-minimax-asr/compare/533a699...v0.2.0
 [0.1.0]: https://github.com/moluyao/dsh-minimax-asr/commit/533a699
+

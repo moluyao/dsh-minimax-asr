@@ -189,6 +189,7 @@ MINIMAX_API_KEY=... node tests/smoke.mjs <音频文件> [response_format] [times
 MINIMAX_API_KEY=... node tests/route-smoke.mjs <音频文件>
 node tests/client-smoke.mjs
 node tests/installed-check.mjs <profile 目录>
+node tests/no-bom.mjs
 ```
 
 - `tests/smoke.mjs`：加载 `lib/index.js`，用桩上下文执行 `apply`，再对真实接口跑一次工具调用。
@@ -240,3 +241,4 @@ node tests/installed-check.mjs <profile 目录>
 ## License
 
 MIT
+- `tests/no-bom.mjs`：扫描整棵目录树里有没有 UTF-8 BOM。`JSON.parse` 不会吃掉 U+FEFF，所以 `package.json` 或 bundle 补丁一旦带 BOM，**profile 组合会直接失败、端口起不来**；而这个插件是 `link:` 方式装进 profile 的，也就是说这份工作区就是宿主读到的文件。

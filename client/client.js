@@ -47,6 +47,9 @@ var STREAM_RETRY_MS = 4000
 /** How long an always-on loop waits before trying to listen again. */
 var LOOP_RETRY_MS = 5000
 
+/** Ceiling for that retry's backoff, so a refused microphone keeps trying quietly. */
+var LOOP_RETRY_MAX_MS = 60000
+
 /** Host route listing the account's voices, for the card's picker. */
 var VOICES_ROUTE = '/minimax-asr/voices'
 
@@ -76,8 +79,10 @@ var VAD_FLOOR_FACTOR = 3
 var VAD_MAX_GATE = 0.03
 /** Ignore this much audio at the start, while the meter settles. */
 var VAD_SETTLE_MS = 300
-/** Silence after speech that ends the turn. */
-var VAD_SILENCE_MS = 1200
+/** Silence after speech that ends the turn, when the section names nothing. */
+var VAD_SILENCE_MS = 5000
+/** Longest single spoken turn, when the section names nothing. */
+var VAD_MAX_TURN_MS = 300000
 /**
  * Release the microphone only after this long with nothing said at all. The
  * window rolls over long before this, so a user who pauses to think keeps
@@ -87,8 +92,6 @@ var VAD_SILENCE_MS = 1200
 var VAD_IDLE_MS = 30 * 60 * 1000
 /** How often the measured level is reported to the host, for tuning. */
 var VAD_REPORT_MS = 1000
-/** Longest single spoken turn the loop will record. */
-var VAD_MAX_TURN_MS = 60000
 
 /**
  * Report one wiring fact to the host. A deployment that composes no web server
@@ -140,10 +143,13 @@ var FIELDS = [
   { key: 'speakMaxChars', label: 'speakMaxChars', numeric: true },
   // Rendered as a checkbox by the handsfree block, like `speakEnabled`.
   { key: 'voiceLoop', label: 'voiceLoop', numeric: false },
+  { key: 'voiceSilenceSeconds', label: 'voiceSilenceSeconds', numeric: true },
+  { key: 'voiceMaxTurnSeconds', label: 'voiceMaxTurnSeconds', numeric: true },
 ]
 
 var NUMERIC_FIELDS = {
-  maxRecordSeconds: true, maxFileMB: true, timeoutMs: true, ttsSpeed: true, speakMaxChars: true,
+  maxRecordSeconds: true, maxFileMB: true, timeoutMs: true,
+  ttsSpeed: true, speakMaxChars: true, voiceSilenceSeconds: true, voiceMaxTurnSeconds: true,
 }
 
 /** Boolean fields; a checkbox writes `true`/`false`, never a string. */
@@ -202,6 +208,8 @@ var DICTIONARIES = {
     speakUnsupported: 'This browser cannot play speech here.',
     speakBlocked: 'The browser blocked playback; click anywhere on the page and try again.',
     voiceLoop: 'Handsfree conversation: listen after every reply and send what I say',
+    voiceSilenceSeconds: 'Pause that ends my sentence (seconds)',
+    voiceMaxTurnSeconds: 'Send anyway after this long (seconds)',
     voiceLoopHint: 'While this is on the microphone reopens by itself once a reply has been read out, and a finished transcript is submitted without a click. Switching it off releases the microphone.',
     voiceStart: 'Start handsfree conversation',
     voiceStop: 'Stop handsfree conversation',
@@ -267,6 +275,8 @@ var DICTIONARIES = {
     speakUnsupported: '当前浏览器无法播放语音。',
     speakBlocked: '浏览器拦截了自动播放，请在页面任意处点击一次后重试。',
     voiceLoop: '实时对话：每轮回复念完后自动开麦，我说完就自动发送',
+    voiceSilenceSeconds: '停顿多久算我说完（秒）',
+    voiceMaxTurnSeconds: '连续说满多久就强制发送（秒）',
     voiceLoopHint: '开启后，播报结束时麦克风会自己打开，检测到你说完就自动转写并发送，全程不用点按钮；关闭会立刻释放麦克风。',
     voiceStart: '开始实时对话',
     voiceStop: '结束实时对话',
@@ -1222,6 +1232,31 @@ MicController.prototype.retry = function () {
   return this.listen({ force: true }) === true
 }
 
+/**
+ * How long a pause means the sentence is over, from the settings section.
+ * A short gap sends while the user is still thinking; a long one makes the
+ * exchange feel slow. The user owns that trade-off.
+ * @returns milliseconds in `[1000, 60000]`.
+ */
+MicController.prototype.silenceMs = function () {
+  var value = this.scope === undefined ? undefined : this.scope.getSnapshot().value
+  var declared = value !== null && typeof value === 'object' ? Number(value.voiceSilenceSeconds) : Number.NaN
+  if (!isFinite(declared)) return VAD_SILENCE_MS
+  return Math.min(60000, Math.max(1000, declared * 1000))
+}
+
+/**
+ * Longest single spoken turn before it is sent anyway, from the settings
+ * section: the safety valve for a window that never goes quiet.
+ * @returns milliseconds in `[10000, 600000]`.
+ */
+MicController.prototype.maxTurnMs = function () {
+  var value = this.scope === undefined ? undefined : this.scope.getSnapshot().value
+  var declared = value !== null && typeof value === 'object' ? Number(value.voiceMaxTurnSeconds) : Number.NaN
+  if (!isFinite(declared)) return VAD_MAX_TURN_MS
+  return Math.min(600000, Math.max(10000, declared * 1000))
+}
+
 /** Stop the level meter and its frame clock. */
 MicController.prototype.stopMeter = function () {
   if (this.vadTimer !== null) {
@@ -1312,7 +1347,7 @@ MicController.prototype.startMeter = function () {
         seconds: Math.floor(elapsed / 1000),
       })
     }
-    if (spoken && self.quietSince !== 0 && now - self.quietSince >= VAD_SILENCE_MS) {
+    if (spoken && self.quietSince !== 0 && now - self.quietSince >= self.silenceMs()) {
       if (self.speechFrames < VAD_MIN_SPEECH_FRAMES) {
         // A blip, not a sentence. Sending this would have the recogniser invent
         // one, and the loop would post the invention as the user's words — but
@@ -1325,7 +1360,7 @@ MicController.prototype.startMeter = function () {
       self.stop()
       return
     }
-    if (spoken && elapsed >= VAD_MAX_TURN_MS) {
+    if (spoken && elapsed >= self.maxTurnMs()) {
       if (self.speechFrames < VAD_MIN_SPEECH_FRAMES) {
         self.rollHandsfree()
         return
@@ -1457,11 +1492,16 @@ MicController.prototype.beginWindow = function (stream) {
     var seconds = Math.floor((Date.now() - self.startedAt) / 1000)
     if (self.vad !== true) self.publish({ seconds: seconds })
     if (seconds >= limit) {
-      // Handsfree listening does not end here: the window is discarded and a
-      // fresh one opens on the same stream, because the user may simply not
-      // have spoken yet.
-      if (self.vad === true) self.rollHandsfree()
-      else self.stop()
+      // A full window with speech in it is a long turn: send it. A full window
+      // with no speech in it is just the user thinking: discard it and keep
+      // listening. Discarding both would throw away a long answer, which is
+      // exactly the thing the person speaking would notice.
+      if (self.vad !== true) {
+        self.stop()
+        return
+      }
+      if (self.speechFrames >= VAD_MIN_SPEECH_FRAMES) self.stop()
+      else self.rollHandsfree()
     }
   }, 500)
   if (this.vad === true) {
@@ -1704,6 +1744,8 @@ function SpeechController(ctx, mic) {
   this.arming = false
   /** Pending self-heal of an always-on loop; see scheduleRetry. */
   this.retryListening = null
+  /** Consecutive failed retries, for the backoff. */
+  this.retryCount = 0
   // Pending reopen of a refused announcement stream; see open().
   this.retry = null
   // The mounted session's composer, handed over by the composer control.
@@ -1961,6 +2003,10 @@ SpeechController.prototype.syncLoopOnce = function () {
 SpeechController.prototype.scheduleRetry = function () {
   var self = this
   if (this.retryListening !== null) return
+  // Back off: a microphone that keeps refusing must not become a five-second
+  // retry storm, but it must never stop trying either.
+  this.retryCount += 1
+  var delay = Math.min(LOOP_RETRY_MS * Math.pow(2, this.retryCount - 1), LOOP_RETRY_MAX_MS)
   this.retryListening = window.setTimeout(function () {
     self.retryListening = null
     if (self.loopEnabled() !== true) return
@@ -1974,12 +2020,13 @@ SpeechController.prototype.scheduleRetry = function () {
     // Open the microphone again rather than re-running the state machine: an
     // error state would otherwise pause it straight back.
     if (self.mic.retry() === true) {
+      self.retryCount = 0
       self.publish({ stage: 'listening', loopNote: null })
       reportEvent({ event: 'voice-loop-retry', mic: micStatus })
       return
     }
     self.scheduleRetry()
-  }, LOOP_RETRY_MS)
+  }, delay)
 }
 
 /** Open the microphone for the user's turn, unless it is already open. */

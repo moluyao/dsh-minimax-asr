@@ -97,6 +97,9 @@ const scopeSnapshot = {
     ttsSpeed: 1,
     speakMaxChars: 220,
     voiceLoop: false,
+    // Short values keep the frame-driven tests quick; the shipped default is 5 s.
+    voiceSilenceSeconds: 1,
+    voiceMaxTurnSeconds: 120,
   },
   // Presence in `user` is what marks a field overridden.
   user: { model: 'asr-1.0' },
@@ -1152,6 +1155,52 @@ check(submissions.some(entry => entry.kind === 'submit'), 'the transcript was su
 check(speechStore.getSnapshot().exchanges === 1, `one exchange counted (${speechStore.getSnapshot().exchanges})`)
 check(speechStore.getSnapshot().stage === 'thinking', `stage is thinking (${speechStore.getSnapshot().stage})`)
 check(micStore.getSnapshot().status === 'idle', 'the microphone is shut while the agent works')
+
+// 1f. A full window that contains speech is a long turn, not a reason to throw
+// the audio away: the cap has to send it. Only a silent window rolls over.
+voiceFace.toggleLoop()
+voiceFace.toggleLoop()
+await tick(4)
+const uploadsBeforeLong = media.calls.length
+media.level = 0.05
+vadFrames(9)
+media.level = 0
+vadFrames(200)
+await tick(16)
+check(media.calls.length === uploadsBeforeLong + 1,
+  `a capped window with speech in it was sent, not discarded (${media.calls.length - uploadsBeforeLong})`)
+
+// 1g. A refused microphone backs off instead of retrying every five seconds.
+micStore.set({ status: 'error', seconds: 0, error: 'microphone permission was refused', text: '', textSeq: 15, supported: true })
+await tick(4)
+const pendingTimersBeforeRetry = timers.filter(entry => !entry.cleared).length
+runTimers()
+await tick(4)
+check(timers.filter(entry => !entry.cleared && entry.ms >= 10000).length > 0,
+  'the retry backs off rather than hammering it')
+check(pendingTimersBeforeRetry >= 0, 'the backoff was scheduled after the first failure')
+
+// 2b. "A pause means I am finished" is a setting, not a constant: the whole
+// point is that a person who pauses to think is not cut off mid-sentence.
+scopeSnapshot.value.voiceSilenceSeconds = 3
+for (const listener of scopeListeners) listener()
+voiceFace.toggleLoop()
+voiceFace.toggleLoop()
+await tick(4)
+const uploadsBeforePause = media.calls.length
+media.level = 0.05
+vadFrames(9)
+media.level = 0
+vadFrames(20)
+await tick(6)
+check(media.calls.length === uploadsBeforePause, `a 2 s pause does not end the sentence (${media.calls.length - uploadsBeforePause} sent)`)
+const seqBeforePause = micStore.getSnapshot().textSeq
+vadFrames(14)
+await tick(14)
+check(media.calls.length === uploadsBeforePause + 1, `a 3 s pause does (${media.calls.length - uploadsBeforePause} sent)`)
+check(micStore.getSnapshot().textSeq === seqBeforePause + 1, `the second transcript advanced (${micStore.getSnapshot().textSeq})`)
+scopeSnapshot.value.voiceSilenceSeconds = 1
+for (const listener of scopeListeners) listener()
 
 // 3. The reply arrives: it is spoken, and then the microphone reopens by itself.
 announce('我把那件事做完了。', 21)

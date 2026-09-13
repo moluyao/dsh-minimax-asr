@@ -18,8 +18,12 @@
         ttsModel: speech-2.8-hd
         ttsVoice: male-qn-jingying
         ttsSpeed: 1
-        speakMaxChars: 220
+        speakMaxChars: 80
         # Handsfree conversation: after each spoken reply the microphone
         # reopens by itself, and a finished transcript is submitted with no
         # click. Off unless the user asks for it (the composer's 对话 button).
         voiceLoop: false
+        # How long a pause means the sentence is finished, and the longest one
+        # spoken turn may run before it is sent anyway.
+        voiceSilenceSeconds: 5
+        voiceMaxTurnSeconds: 300
